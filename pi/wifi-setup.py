@@ -42,6 +42,40 @@ def validate(ssid, password):
         raise ValueError('Use an 8 to 63 character Wi-Fi password, or leave blank for an open network.')
 
 
+def parse_networks(output):
+    networks = {}
+    for line in output.splitlines():
+        fields, current, escaped = [], '', False
+        for char in line:
+            if escaped:
+                current += char
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == ':':
+                fields.append(current)
+                current = ''
+            else:
+                current += char
+        fields.append(current)
+        if escaped or len(fields) != 3:
+            continue
+        ssid, signal, raw_security = fields
+        if ssid == 'BAPS-Signage-Setup':
+            continue
+        try:
+            validate(ssid, '')
+            signal = max(0, min(100, int(signal)))
+        except ValueError:
+            continue
+        security = 'open' if raw_security in ('', '--') else ('personal' if ('WPA1' in raw_security or 'WPA2' in raw_security) and not any(item in raw_security for item in ('802.1X', 'EAP', 'WEP')) else 'unsupported')
+        item = {'ssid': ssid, 'signal': signal, 'security': security, 'supported': security != 'unsupported'}
+        key = (ssid, security)
+        if key not in networks or networks[key]['signal'] < signal:
+            networks[key] = item
+    return sorted(networks.values(), key=lambda item: (-item['signal'], item['ssid']))[:100]
+
+
 class NetworkManager:
     def __init__(self, interface, password, directory=Path('/etc/NetworkManager/system-connections')):
         if not re.fullmatch(r'[a-zA-Z0-9_-]{1,15}', interface):
@@ -51,15 +85,15 @@ class NetworkManager:
         self.interface, self.password, self.directory = interface, password, Path(directory)
         self.retry_offset = 0
 
-    def run(self, *args, wait=10):
+    def run(self, *args, wait=10, preserve=False):
         try:
-            result = subprocess.run(['/usr/bin/nmcli', '--wait', str(wait), *args], capture_output=True, text=True, timeout=wait + 5, env={**{key: value for key, value in os.environ.items() if not key.startswith('WIFI_')}, 'LC_ALL': 'C'})
+            result = subprocess.run(['/usr/bin/nmcli', '--colors', 'no', '--wait', str(wait), *args], capture_output=True, text=True, timeout=wait + 5, env={**{key: value for key, value in os.environ.items() if not key.startswith('WIFI_')}, 'LC_ALL': 'C'})
         except (OSError, subprocess.TimeoutExpired):
             raise NetworkError('NetworkManager did not respond.') from None
         if result.returncode:
             # nmcli output can contain network names or secrets; never return it.
             raise NetworkError('NetworkManager could not complete the request.')
-        return result.stdout.strip()
+        return result.stdout if preserve else result.stdout.strip()
 
     def devices(self):
         names = self.run('-t', '--escape', 'no', '-f', 'DEVICE', 'device', 'status').splitlines()
@@ -90,6 +124,34 @@ class NetworkManager:
         if not any(name == self.interface and kind == 'wifi' for name, kind, _, _ in devices):
             raise NetworkError('Configured Wi-Fi adapter is unavailable.')
         return connected, hotspot
+
+    def last_scan(self):
+        path = self.run('-g', 'GENERAL.DBUS-PATH', 'device', 'show', self.interface)
+        if not re.fullmatch(r'/org/freedesktop/NetworkManager/Devices/[0-9]+', path):
+            raise NetworkError('NetworkManager scan status is unavailable.')
+        try:
+            result = subprocess.run(['/usr/bin/busctl', '--system', 'get-property', 'org.freedesktop.NetworkManager', path, 'org.freedesktop.NetworkManager.Device.Wireless', 'LastScan'], capture_output=True, text=True, timeout=5, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+            match = re.fullmatch(r'x (-?[0-9]+)\s*', result.stdout)
+            if result.returncode or not match:
+                raise NetworkError('NetworkManager scan status is unavailable.')
+            return int(match.group(1))
+        except (OSError, subprocess.TimeoutExpired):
+            raise NetworkError('NetworkManager scan status is unavailable.') from None
+
+    def scan(self, cached=False):
+        before = None
+        if not cached:
+            before = self.last_scan()
+            # Unlike wifi list, rescan returns an error when RequestScan is rejected.
+            self.run('device', 'wifi', 'rescan', 'ifname', self.interface, wait=10)
+        output = self.run('-t', '--escape', 'yes', '-f', 'SSID,SIGNAL,SECURITY', 'device', 'wifi', 'list', 'ifname', self.interface, '--rescan', 'no' if cached else 'yes', wait=15, preserve=True)
+        # wifi list can silently print old results after a rejected/timed-out scan.
+        if not cached:
+            if self.last_scan() <= before:
+                raise NetworkError('No completed Wi-Fi scan was reported.')
+            # Scan completion may occur after wifi list prints a timeout cache.
+            output = self.run('-t', '--escape', 'yes', '-f', 'SSID,SIGNAL,SECURITY', 'device', 'wifi', 'list', 'ifname', self.interface, '--rescan', 'no', wait=10, preserve=True)
+        return parse_networks(output)
 
     def profiles(self):
         lines = self.run('-t', '--escape', 'no', '-f', 'UUID,TYPE', 'connection', 'show').splitlines()
@@ -226,6 +288,12 @@ class Controller:
         self.busy = False
         self.worker = None
         self.stopped = threading.Event()
+        self.networks = []
+        self.scanning = False
+        self.cached = True
+        self.scan_message = 'Refresh to look for nearby networks, or enter the Wi-Fi name.'
+        self.last_scan = None
+        self.cache_initialized = False
 
     def tick(self, now):
         if self.busy:
@@ -238,12 +306,66 @@ class Controller:
             self.offline_since = None
         elif hotspot:
             self.mode = 'setup'
+            if not self.cache_initialized:
+                self.cache_initialized = True
+                try:
+                    self.networks = self.nm.scan(cached=True)
+                    self.scan_message = 'Previously detected networks. Refresh to check again.'
+                except NetworkError:
+                    pass
         else:
             if self.offline_since is None:
                 self.offline_since = now
             if now - self.offline_since >= self.delay:
+                try:
+                    self.networks = self.nm.scan()
+                    self.cache_initialized = True
+                    self.cached = True
+                    self.scan_message = 'Nearby networks found before starting setup.'
+                except NetworkError:
+                    self.scan_message = 'Nearby networks could not be checked. Enter the Wi-Fi name or refresh.'
                 self.nm.ensure_hotspot()
                 self.mode, self.message = 'setup', 'Connect this display to Wi-Fi.'
+
+    def refresh(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if self.busy or self.mode != 'setup' or (self.last_scan is not None and now - self.last_scan < 10):
+                return False
+            self.busy = self.scanning = True
+            self.last_scan = now
+            self.scan_message = 'Looking for nearby networks. Reconnect to setup if it briefly disappears.'
+        def scan():
+            paused = False
+            try:
+                if self.stopped.wait(3):
+                    return
+                try:
+                    networks = self.nm.scan()
+                except NetworkError:
+                    # Some adapters cannot scan in AP mode. User explicitly requested this pause.
+                    if self.stopped.is_set():
+                        return
+                    self.nm.stop_hotspot()
+                    paused = True
+                    networks = self.nm.scan()
+                self.networks = networks
+                self.cached = False
+                self.scan_message = 'Nearby networks refreshed.'
+            except NetworkError:
+                self.cached = True
+                self.scan_message = 'Could not refresh. Showing previous results; manual entry is available.'
+            finally:
+                if paused and not self.stopped.is_set():
+                    try:
+                        self.nm.ensure_hotspot()
+                    except NetworkError:
+                        self.mode = 'waiting'
+                        self.offline_since = None
+                self.busy = self.scanning = False
+        self.worker = threading.Thread(target=scan)
+        self.worker.start()
+        return True
 
     def submit(self, ssid=None, password=None):
         with self.lock:
@@ -307,6 +429,8 @@ def handler(controller, template, token):
                 return self.reply(403, {'error': 'Unavailable'})
             if self.path == '/':
                 return self.reply(200, template.replace('__CSRF_TOKEN__', token), True)
+            if self.path == '/networks':
+                return self.reply(200, {'networks': controller.networks, 'scanning': controller.scanning, 'cached': controller.cached, 'message': controller.scan_message})
             if self.path == '/status':
                 return self.reply(200, {'mode': controller.mode, 'message': controller.message})
             self.reply(404, {'error': 'Unavailable'})
@@ -324,6 +448,8 @@ def handler(controller, template, token):
                 if self.path == '/connect':
                     validate(body.get('ssid'), body.get('password'))
                     accepted = controller.submit(body['ssid'], body['password'])
+                elif self.path == '/scan':
+                    accepted = controller.refresh()
                 elif self.path == '/retry':
                     accepted = controller.submit()
                 else:

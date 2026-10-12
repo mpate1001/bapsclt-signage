@@ -23,6 +23,8 @@ class FakeNM:
         self.hotspot = False
     def connect(self, *_):
         raise w.NetworkError('failure')
+    def scan(self, cached=False):
+        raise w.NetworkError()
     def retry_saved(self):
         raise w.NetworkError('failure')
 
@@ -272,3 +274,179 @@ def test_successful_unloaded_candidate_credentials_preserved(tmp_path, monkeypat
     assert path.read_text() == original
     assert calls[0] == ('connection', 'load', str(path))
     assert not any(call[:2] == ('connection', 'delete') for call in calls)
+
+
+def test_network_scan_parser_preserves_names_and_classifies():
+    rows = r''' leading\:name\\ :30:WPA2
+ leading\:name\\ :90:WPA2
+Open:55:--
+Enterprise:80:WPA2 802.1X
+Modern:90:WPA3
+Old:70:WEP
+BAPS-Signage-Setup:100:WPA2
+:20:WPA2
+65;66;:10:WPA2'''
+    result = w.parse_networks(rows)
+    by_name = {item['ssid']: item for item in result}
+    assert by_name[' leading:name\\ ']['signal'] == 90
+    assert by_name['Open']['security'] == 'open'
+    assert by_name['Enterprise']['security'] == 'unsupported'
+    assert not by_name['Modern']['supported'] and not by_name['Old']['supported']
+    assert 'BAPS-Signage-Setup' not in by_name and '' not in by_name
+    assert '65;66;' in by_name
+    assert len(w.parse_networks('\n'.join(f'Network{i}:80:WPA2' for i in range(200)))) == 100
+
+
+@pytest.mark.parametrize('second_fails', [False, True])
+def test_scan_ap_pause_and_restore_serialization(second_fails):
+    nm = FakeNM()
+    nm.hotspot = True
+    scans = []
+    def scan(cached=False):
+        scans.append(True)
+        if len(scans) == 1 or second_fails:
+            raise w.NetworkError()
+        return [{'ssid':'Nearby','signal':90,'security':'personal','supported':True}]
+    nm.scan = scan
+    c = w.Controller(nm)
+    c.mode = 'setup'
+    c.networks = [{'ssid':'Previous'}]
+    class Gate:
+        def __init__(self): self.ready = threading.Event()
+        def wait(self, _): self.ready.wait(2); return False
+        def is_set(self): return False
+    c.stopped = Gate()
+    assert c.refresh(100)
+    assert not c.submit('network','private-password') and not c.submit() and not c.refresh(101)
+    c.stopped.ready.set()
+    c.worker.join(3)
+    assert nm.hotspot and nm.started == 1
+    assert not c.busy and not c.scanning
+    assert c.cached == second_fails
+    assert c.networks[0]['ssid'] == ('Previous' if second_fails else 'Nearby')
+    assert not c.refresh(105)
+
+
+def test_scan_shutdown_and_outside_setup_do_not_scan():
+    nm = FakeNM()
+    c = w.Controller(nm)
+    assert not c.refresh()
+    c.mode = 'setup'
+    c.stopped.set()
+    assert c.refresh()
+    c.worker.join(2)
+    assert not c.busy and nm.started == 0
+
+
+def test_existing_hotspot_uses_cached_scan_after_service_restart():
+    nm = FakeNM()
+    nm.hotspot = True
+    calls = []
+    nm.scan = lambda cached=False: calls.append(cached) or [{'ssid':'Saved result'}]
+    c = w.Controller(nm)
+    c.tick(0)
+    c.tick(1)
+    assert calls == [True] and c.cached and c.networks[0]['ssid'] == 'Saved result'
+
+
+def test_scan_does_not_reactivate_hotspot_when_network_returns():
+    class ArrivingNM(FakeNM):
+        def scan(self, cached=False):
+            if self.hotspot:
+                raise w.NetworkError()
+            self.connected = True
+            return []
+        def ensure_hotspot(self):
+            if not self.connected: super().ensure_hotspot()
+    nm = ArrivingNM()
+    nm.hotspot = True
+    c = w.Controller(nm)
+    c.mode = 'setup'
+    class Immediate:
+        def wait(self, _): return False
+        def is_set(self): return False
+    c.stopped = Immediate()
+    c.refresh()
+    c.worker.join(2)
+    assert nm.connected and not nm.hotspot and nm.started == 0
+
+
+def test_scan_requests_completed_refresh_and_preserves_output():
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    calls = []
+    stamps = iter([100, 101])
+    nm.last_scan = lambda: next(stamps)
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return ' leading :90:WPA2\n'
+    nm.run = run
+    assert nm.scan()[0]['ssid'] == ' leading '
+    assert calls[0][0] == ('device','wifi','rescan','ifname','wlan0')
+    assert calls[1][0][-2:] == ('--rescan','yes')
+    assert calls[1][1] == {'wait':15,'preserve':True}
+    nm.scan(cached=True)
+    assert calls[2][0][-2:] == ('--rescan','no')
+    assert calls[3][0][-2:] == ('--rescan','no')
+
+
+def test_scan_cached_exit_zero_is_not_fresh():
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    nm.last_scan = lambda: 123
+    nm.run = lambda *args, **kwargs: 'OldNetwork:80:WPA2\n'
+    with pytest.raises(w.NetworkError):
+        nm.scan()
+    assert nm.scan(cached=True)[0]['ssid'] == 'OldNetwork'
+
+
+def test_scan_rejected_request_does_not_read_stale_list():
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    nm.last_scan = lambda: 123
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        raise w.NetworkError()
+    nm.run = run
+    with pytest.raises(w.NetworkError):
+        nm.scan()
+    assert calls == [('device','wifi','rescan','ifname','wlan0')]
+
+
+def test_scan_timestamp_status_and_bad_device_path(monkeypatch):
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    nm.run = lambda *args, **kwargs: '/org/freedesktop/NetworkManager/Devices/2'
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, 'x 4321\n', '')
+    monkeypatch.setattr(subprocess, 'run', run)
+    assert nm.last_scan() == 4321
+    assert calls[0][-2:] == ['org.freedesktop.NetworkManager.Device.Wireless', 'LastScan']
+    nm.run = lambda *args, **kwargs: 'bad;path'
+    with pytest.raises(w.NetworkError): nm.last_scan()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('result', ['malformed','failed','timeout'])
+def test_scan_timestamp_failure_sanitized(monkeypatch, result):
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    nm.run = lambda *args, **kwargs: '/org/freedesktop/NetworkManager/Devices/2'
+    def run(args, **kwargs):
+        if result == 'timeout':
+            raise subprocess.TimeoutExpired('private-output', 5)
+        return subprocess.CompletedProcess(args, 1 if result == 'failed' else 0, 'private-output', 'private-output')
+    monkeypatch.setattr(subprocess, 'run', run)
+    with pytest.raises(w.NetworkError) as error:
+        nm.last_scan()
+    assert 'private-output' not in str(error.value)
+
+
+def test_scan_rereads_cache_after_completed_timestamp():
+    nm = w.NetworkManager('wlan0', 'hotspot-password')
+    stamps = iter([100, 101])
+    nm.last_scan = lambda: next(stamps)
+    def run(*args, **kwargs):
+        if args[-2:] == ('--rescan','yes'): return 'Old:80:WPA2\n'
+        if args[-2:] == ('--rescan','no'): return 'New:80:WPA2\n'
+        return ''
+    nm.run = run
+    assert nm.scan()[0]['ssid'] == 'New'

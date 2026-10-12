@@ -257,8 +257,16 @@ or stop your existing services.
 
 The Pi can offer a password-protected **BAPS-Signage-Setup** network when neither
 Ethernet nor saved Wi-Fi connects for 120 seconds. Connect a phone to that network,
-then open **http://10.42.0.1:8091/** in its browser. Enter the new Wi-Fi name and
-password, or choose **Retry saved Wi-Fi networks** if an existing network is back.
+then open **http://10.42.0.1:8091/** in its browser. Choose your network from the
+nearby Wi-Fi list and enter its password, or choose **Retry saved Wi-Fi networks**
+if an existing network is back. The list shows signal strength and whether a
+password is needed. Networks with unsupported security, including organization sign-in, are
+unavailable for selection. For a hidden network, choose **Enter a Wi-Fi name manually**.
+
+The initial list uses networks detected before the hotspot started. Choose
+**Refresh nearby networks** to look again. Some Wi-Fi adapters temporarily pause
+the setup hotspot while scanning; if your phone disconnects, reconnect to
+**BAPS-Signage-Setup** and reload the page to see the new list.
 There is no automatic captive-portal popup; open the address yourself. Your phone
 may warn that this setup network has no internet. Stay connected to complete setup.
 
@@ -284,10 +292,14 @@ manages the Wi-Fi adapter on your Raspberry Pi OS installation:
 ```sh
 systemctl is-active NetworkManager
 nmcli --version
+busctl --version
 nmcli -f GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE device show wlan0
 ```
 
 Continue only when NetworkManager is active and `wlan0` is a managed Wi-Fi device.
+Nearby-network refresh also needs `busctl`, provided by systemd on Raspberry Pi OS,
+to confirm scan freshness. If scan status is unavailable, the page still supports
+manual entry of the Wi-Fi name and password.
 If your adapter has another name, set `WIFI_INTERFACE` accordingly in the private
 configuration below. If another network manager owns the adapter, configure that
 separately before enabling this helper. NetworkManager's shared IPv4 mode needs

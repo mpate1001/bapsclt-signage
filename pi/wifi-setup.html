@@ -14,8 +14,10 @@
     h1 { font-size: 30px; line-height: 1.15; margin: 16px 0; }
     p { line-height: 1.55; color: #4b6268; }
     label { display: block; font-weight: 650; margin: 20px 0 8px; }
-    input[type=text], input[type=password] { width: 100%; min-height: 48px; border: 1px solid #8da9a3; border-radius: 8px; padding: 12px; font: inherit; }
-    input:focus-visible, button:focus-visible { outline: 3px solid #49a48e; outline-offset: 3px; }
+    input[type=text], input[type=password], select { width: 100%; min-height: 48px; border: 1px solid #8da9a3; border-radius: 8px; padding: 12px; font: inherit; }
+    input:focus-visible, button:focus-visible, select:focus-visible { outline: 3px solid #49a48e; outline-offset: 3px; }
+    select { min-width: 0; max-width: 100%; }
+    [hidden] { display: none !important; }
     .check { display: flex; gap: 10px; align-items: center; font-weight: 450; }
     .check input { width: 20px; height: 20px; accent-color: #1c6a5b; }
     button { width: 100%; margin-top: 24px; border: 0; border-radius: 8px; background: #1c6a5b; color: white; min-height: 48px; padding: 12px; font: inherit; font-weight: 700; cursor: pointer; }
@@ -32,10 +34,19 @@
   <main>
     <div class="eyebrow">BAPS Charlotte · Display setup</div>
     <h1>Connect to Wi-Fi</h1>
-    <p>Enter the Wi-Fi details for this location. Your display will keep playing its saved video while it connects.</p>
+    <p>Choose the Wi-Fi network for this location, then enter its password. Your display will keep playing its saved video while it connects.</p>
     <form id="wifi-form">
-      <label for="ssid">Wi-Fi name</label>
-      <input id="ssid" name="ssid" type="text" required autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="Enter the exact network name">
+      <div id="network-picker">
+        <label for="network">Nearby Wi-Fi networks</label>
+        <select id="network" required aria-describedby="network-help"><option value="">Loading nearby networks…</option></select>
+        <p id="network-help" class="note" aria-live="polite">Checking the display’s nearby networks.</p>
+      </div>
+      <button id="refresh" class="secondary" type="button">Refresh nearby networks</button>
+      <label class="check" for="manual"><input id="manual" type="checkbox">Enter a Wi-Fi name manually</label>
+      <div id="manual-fields" hidden>
+        <label for="ssid">Wi-Fi name</label>
+        <input id="ssid" name="ssid" type="text" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="Enter the exact network name">
+      </div>
       <label for="password">Wi-Fi password</label>
       <input id="password" name="password" type="password" required autocomplete="off" spellcheck="false" autocapitalize="none">
       <label class="check" for="show-password"><input id="show-password" type="checkbox">Show password</label>
@@ -58,12 +69,73 @@
     const button = document.getElementById('connect');
     const status = document.getElementById('status');
     const retry = document.getElementById('retry');
+    const refresh = document.getElementById('refresh');
+    const network = document.getElementById('network');
+    const networkHelp = document.getElementById('network-help');
+    const manual = document.getElementById('manual');
+    const ssidInput = document.getElementById('ssid');
     let busy = false;
 
     function tell(message, error = false) {
       status.textContent = message;
       status.dataset.error = String(error);
     }
+
+    function setBusy(value) {
+      busy = value;
+      button.disabled = value;
+      retry.disabled = value;
+      refresh.disabled = value;
+    }
+
+    function setOpenNetwork(value) {
+      openNetwork.checked = value;
+      password.disabled = value;
+      password.required = !value;
+      if (value) password.value = '';
+    }
+
+    function showNetworks(data) {
+      const selected = network.value;
+      network.replaceChildren();
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Choose a Wi-Fi network';
+      network.append(placeholder);
+      const networks = Array.isArray(data.networks) ? [...data.networks] : [];
+      networks.sort((a, b) => Number(b.signal) - Number(a.signal));
+      for (const item of networks) {
+        const option = document.createElement('option');
+        option.value = JSON.stringify([item.ssid, item.security]);
+        option.dataset.ssid = item.ssid;
+        const signal = item.signal >= 70 ? 'Strong signal' : item.signal >= 40 ? 'Fair signal' : 'Weak signal';
+        const security = item.security === 'open' ? 'No password' : item.supported ? 'Password required' : 'Needs separate setup';
+        option.textContent = `${item.ssid} · ${security} · ${signal}`;
+        option.dataset.security = item.security;
+        option.disabled = !item.supported;
+        network.append(option);
+      }
+      if (networks.some(item => JSON.stringify([item.ssid, item.security]) === selected && item.supported)) {
+        network.value = selected;
+        if (!manual.checked) setOpenNetwork(network.selectedOptions[0].dataset.security === 'open');
+      }
+      networkHelp.textContent = networks.length ?
+        (data.cached ? 'Last detected networks. Refresh if your Wi-Fi is missing.' : 'Select your network. Networks marked “Needs separate setup” cannot be configured here.') :
+        'No nearby networks found. Refresh the list or enter your Wi-Fi name manually for a hidden network.';
+    }
+
+    network.addEventListener('change', () => {
+      const selected = network.selectedOptions[0];
+      if (selected && selected.value) setOpenNetwork(selected.dataset.security === 'open');
+    });
+    manual.addEventListener('change', () => {
+      document.getElementById('network-picker').hidden = manual.checked;
+      document.getElementById('manual-fields').hidden = !manual.checked;
+      network.required = !manual.checked;
+      network.disabled = manual.checked;
+      ssidInput.required = manual.checked;
+      if (!manual.checked && network.value) setOpenNetwork(network.selectedOptions[0].dataset.security === 'open');
+    });
 
     async function request(path, options = {}) {
       const controller = new AbortController();
@@ -82,22 +154,18 @@
       password.type = showPassword.checked ? 'text' : 'password';
     });
     openNetwork.addEventListener('change', () => {
-      password.disabled = openNetwork.checked;
-      password.required = !openNetwork.checked;
-      if (openNetwork.checked) password.value = '';
+      setOpenNetwork(openNetwork.checked);
     });
 
     form.addEventListener('submit', async event => {
       event.preventDefault();
       if (busy) return;
-      const ssid = document.getElementById('ssid').value;
+      const ssid = manual.checked ? ssidInput.value : (network.selectedOptions[0]?.dataset.ssid || '');
       if (new TextEncoder().encode(ssid).length > 32) {
         tell('The Wi-Fi name must be no more than 32 bytes. Check the network name and try again.', true);
         return;
       }
-      busy = true;
-      button.disabled = true;
-      retry.disabled = true;
+      setBusy(true);
       button.textContent = 'Connecting…';
       tell('Sending the Wi-Fi details to your display…');
       try {
@@ -115,18 +183,14 @@
           tell(error.message, true);
         }
       } finally {
-        busy = false;
-        button.disabled = false;
-        retry.disabled = false;
+        setBusy(false);
         button.textContent = 'Connect display';
       }
     });
 
     retry.addEventListener('click', async () => {
       if (busy) return;
-      busy = true;
-      button.disabled = true;
-      retry.disabled = true;
+      setBusy(true);
       tell('Asking the display to try its saved Wi-Fi networks…');
       try {
         const data = await request('/retry', {
@@ -141,10 +205,41 @@
           tell(error.message, true);
         }
       } finally {
-        busy = false;
-        button.disabled = false;
-        retry.disabled = false;
+        setBusy(false);
       }
+    });
+
+    refresh.addEventListener('click', async () => {
+      if (busy) return;
+      setBusy(true);
+      tell('Refreshing nearby Wi-Fi. Your phone may briefly disconnect; reconnect to BAPS-Signage-Setup if needed.');
+      try {
+        await request('/scan', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({csrf_token: csrfToken})
+        });
+        const deadline = Date.now() + 45000;
+        let data;
+        do {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          data = await request('/networks');
+          if (!data.scanning) break;
+        } while (Date.now() < deadline);
+        showNetworks(data);
+        tell(data.scanning ? 'The list is still refreshing. Reconnect to the setup network and reload this page shortly.' : (data.message || 'Nearby Wi-Fi networks refreshed.'));
+      } catch (error) {
+        if (error.name === 'AbortError' || error instanceof TypeError) {
+          tell('The setup connection paused while looking for Wi-Fi. Reconnect to BAPS-Signage-Setup and reload this page shortly.');
+        } else {
+          tell(error.message, true);
+        }
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    request('/networks').then(showNetworks).catch(() => {
+      networkHelp.textContent = 'The network list is unavailable. Refresh or enter your Wi-Fi name manually.';
     });
 
     request('/status').then(data => {
