@@ -1,0 +1,22 @@
+[Unit]
+Description=BAPS Charlotte offline Wi-Fi setup hotspot
+Requires=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/bapsclt-signage/wifi.env
+ExecStart=/usr/bin/python3 /usr/local/lib/bapsclt-signage/wifi-setup.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=150
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/NetworkManager/system-connections
+
+[Install]
+WantedBy=multi-user.target

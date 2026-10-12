@@ -12,3 +12,6 @@ data/
 *.mp4
 *.part
 *.log
+
+# Private fallback hotspot configuration
+pi/wifi.env

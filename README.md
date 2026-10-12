@@ -253,6 +253,127 @@ service first; this new agent owns port 8090. Check that its data path does not
 point at old state before you start it. These files do not automatically change
 or stop your existing services.
 
+## Offline Wi-Fi setup hotspot (optional)
+
+The Pi can offer a password-protected **BAPS-Signage-Setup** network when neither
+Ethernet nor saved Wi-Fi connects for 120 seconds. Connect a phone to that network,
+then open **http://10.42.0.1:8091/** in its browser. Enter the new Wi-Fi name and
+password, or choose **Retry saved Wi-Fi networks** if an existing network is back.
+There is no automatic captive-portal popup; open the address yourself. Your phone
+may warn that this setup network has no internet. Stay connected to complete setup.
+
+The setup network disappears when the Pi tries Wi-Fi. Wait up to two minutes; if
+it returns, reconnect to it and reopen the page to retry. A failed attempt restores
+the setup network. Saved networks are retried only when you request it on the page,
+so the setup connection stays available while you enter details. Connecting
+Ethernet stops the setup hotspot automatically. An internet outage on a working
+local network does not trigger fallback. Cached signage playback continues; new
+video downloads and remote management return when internet access returns.
+
+This feature uses NetworkManager and the Pi's Wi-Fi adapter. It supports ordinary
+WPA personal networks and, when explicitly selected, networks without a password.
+Enterprise Wi-Fi and networks requiring a browser sign-in are not supported by the
+setup page. It does not change the Pi's Wi-Fi country setting. Use the existing
+Raspberry Pi OS configuration tools to set the correct country before deployment.
+
+### Install on the Pi
+
+This is opt-in and needs no TrueNAS changes. First confirm that NetworkManager
+manages the Wi-Fi adapter on your Raspberry Pi OS installation:
+
+```sh
+systemctl is-active NetworkManager
+nmcli --version
+nmcli -f GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE device show wlan0
+```
+
+Continue only when NetworkManager is active and `wlan0` is a managed Wi-Fi device.
+If your adapter has another name, set `WIFI_INTERFACE` accordingly in the private
+configuration below. If another network manager owns the adapter, configure that
+separately before enabling this helper. NetworkManager's shared IPv4 mode needs
+`dnsmasq-base`; install the binary package without adding a second DHCP daemon:
+
+```sh
+sudo apt update
+sudo apt install -y network-manager dnsmasq-base
+```
+
+From `/home/admin/bapsclt-signage`, install root-owned copies. The privileged helper
+runs these copies rather than writable files from the Git checkout:
+
+```sh
+sudo install -d -o root -g root -m 755 /usr/local/lib/bapsclt-signage
+sudo install -o root -g root -m 755 pi/wifi-setup.py /usr/local/lib/bapsclt-signage/
+sudo install -o root -g root -m 644 pi/wifi-setup.html /usr/local/lib/bapsclt-signage/
+sudo install -d -o root -g root -m 755 /etc/bapsclt-signage
+if ! sudo test -e /etc/bapsclt-signage/wifi.env; then
+  sudo install -o root -g root -m 600 pi/wifi.env.example /etc/bapsclt-signage/wifi.env
+fi
+sudo nano /etc/bapsclt-signage/wifi.env
+```
+
+Set `WIFI_HOTSPOT_PASSWORD` to a unique password of 12–63 ASCII characters.
+Leave `WIFI_INTERFACE=wlan0` and `WIFI_FALLBACK_SECONDS=120` unless your installation
+needs different values. Keep this password in the private root-owned file; do not
+commit it or reuse the admin, publisher, or device API credentials. NetworkManager
+stores Wi-Fi credentials in its root-owned connection profiles; the setup page
+does not save passwords in browser storage. Anyone with the setup hotspot password
+can change the Pi's Wi-Fi settings while fallback is active.
+
+```sh
+sudo install -o root -g root -m 644 pi/systemd/bapsclt-signage-wifi.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bapsclt-signage-wifi.service
+sudo systemctl status bapsclt-signage-wifi.service --no-pager
+```
+
+Test locally with the TV and a phone available. Disconnect Ethernet and make the
+saved Wi-Fi unavailable; after the delay, join the setup hotspot and enter working
+Wi-Fi details. Confirm the hotspot disappears, the Pi reconnects, and video keeps
+playing. Test an incorrect password too: the setup hotspot should return. Keep a
+keyboard available for recovery during this first hardware test. These adapter,
+phone, and physical playback checks require the real Pi.
+
+For updates, run these commands from `/home/admin/bapsclt-signage`. Preserve
+`/etc/bapsclt-signage/wifi.env`; do not replace it with the sample configuration:
+
+```sh
+git pull --ff-only
+sudo install -o root -g root -m 755 pi/wifi-setup.py /usr/local/lib/bapsclt-signage/
+sudo install -o root -g root -m 644 pi/wifi-setup.html /usr/local/lib/bapsclt-signage/
+sudo install -o root -g root -m 644 pi/systemd/bapsclt-signage-wifi.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart bapsclt-signage-wifi.service
+```
+
+The normal signage agent and server need no restart for Wi-Fi helper updates.
+
+### Disable or remove the fallback
+
+Disable the helper before changing its reserved NetworkManager connection:
+
+```sh
+sudo systemctl disable --now bapsclt-signage-wifi.service
+sudo nmcli -f connection.id,connection.uuid,802-11-wireless.mode,802-11-wireless.ssid connection show uuid 72c25775-673a-4b48-bf74-511894293f48
+```
+
+Confirm that the displayed profile is `bapsclt-signage-setup`, with mode `ap` and
+SSID `BAPS-Signage-Setup`. Then remove that fixed profile by UUID. This avoids
+removing an unrelated profile with the same name and preserves saved Wi-Fi networks:
+
+```sh
+sudo nmcli connection down uuid 72c25775-673a-4b48-bf74-511894293f48
+sudo nmcli connection delete uuid 72c25775-673a-4b48-bf74-511894293f48
+```
+
+The `down` command may report that the profile is not active. If the helper never
+created the profile, `delete` may report that it does not exist. The cached player
+continues running independently. Connect Ethernet or use the Pi desktop to select
+a saved Wi-Fi network after disabling fallback.
+
+See [NetworkManager shared-network examples](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nmcli-examples.html)
+for the hotspot's shared IPv4 network behavior.
+
 ## Daily use
 
 1. Open `/admin` and sign in.

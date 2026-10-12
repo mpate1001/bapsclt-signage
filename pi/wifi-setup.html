@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Connect your signage display</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #183239; background: #edf3f1; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 18px; }
+    main { max-width: 480px; margin: 5vh auto; background: white; border: 1px solid #d6e2de; border-radius: 20px; padding: 30px; box-shadow: 0 12px 36px #0000000a; }
+    .eyebrow { color: #22685c; font-size: 13px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { font-size: 30px; line-height: 1.15; margin: 16px 0; }
+    p { line-height: 1.55; color: #4b6268; }
+    label { display: block; font-weight: 650; margin: 20px 0 8px; }
+    input[type=text], input[type=password] { width: 100%; min-height: 48px; border: 1px solid #8da9a3; border-radius: 8px; padding: 12px; font: inherit; }
+    input:focus-visible, button:focus-visible { outline: 3px solid #49a48e; outline-offset: 3px; }
+    .check { display: flex; gap: 10px; align-items: center; font-weight: 450; }
+    .check input { width: 20px; height: 20px; accent-color: #1c6a5b; }
+    button { width: 100%; margin-top: 24px; border: 0; border-radius: 8px; background: #1c6a5b; color: white; min-height: 48px; padding: 12px; font: inherit; font-weight: 700; cursor: pointer; }
+    .secondary { background: #e9f2ee; color: #1c6a5b; margin-top: 12px; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .note { font-size: 14px; margin: 20px 0 0; }
+    #status { margin-top: 20px; padding: 14px; background: #edf5f2; border-radius: 8px; line-height: 1.5; }
+    #status:empty { display: none; }
+    #status[data-error=true] { background: #fff0ec; color: #913d2c; }
+    @media (max-width: 420px) { main { padding: 24px; margin-top: 12px; } h1 { font-size: 27px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">BAPS Charlotte · Display setup</div>
+    <h1>Connect to Wi-Fi</h1>
+    <p>Enter the Wi-Fi details for this location. Your display will keep playing its saved video while it connects.</p>
+    <form id="wifi-form">
+      <label for="ssid">Wi-Fi name</label>
+      <input id="ssid" name="ssid" type="text" required autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="Enter the exact network name">
+      <label for="password">Wi-Fi password</label>
+      <input id="password" name="password" type="password" required autocomplete="off" spellcheck="false" autocapitalize="none">
+      <label class="check" for="show-password"><input id="show-password" type="checkbox">Show password</label>
+      <label class="check" for="open-network"><input id="open-network" type="checkbox">This network has no password</label>
+      <button id="connect" type="submit">Connect display</button>
+    </form>
+    <button id="retry" class="secondary" type="button">Retry saved Wi-Fi networks</button>
+    <div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
+    <p class="note">Your phone may disconnect when the display switches networks. Wait about two minutes. If <strong>BAPS-Signage-Setup</strong> returns, reconnect to it, open this page again, and retry.</p>
+    <p class="note">Use a home or office Wi-Fi network. Networks that require a web sign-in or an organization login need separate setup.</p>
+    <noscript><p>Enable JavaScript in your phone’s browser to connect the display.</p></noscript>
+  </main>
+  <script>
+    'use strict';
+    const csrfToken = '__CSRF_TOKEN__';
+    const form = document.getElementById('wifi-form');
+    const password = document.getElementById('password');
+    const openNetwork = document.getElementById('open-network');
+    const showPassword = document.getElementById('show-password');
+    const button = document.getElementById('connect');
+    const status = document.getElementById('status');
+    const retry = document.getElementById('retry');
+    let busy = false;
+
+    function tell(message, error = false) {
+      status.textContent = message;
+      status.dataset.error = String(error);
+    }
+
+    async function request(path, options = {}) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(path, {...options, signal: controller.signal, cache: 'no-store', credentials: 'same-origin'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || data.error || 'The display could not accept these details. Please try again.');
+        return data;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    showPassword.addEventListener('change', () => {
+      password.type = showPassword.checked ? 'text' : 'password';
+    });
+    openNetwork.addEventListener('change', () => {
+      password.disabled = openNetwork.checked;
+      password.required = !openNetwork.checked;
+      if (openNetwork.checked) password.value = '';
+    });
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (busy) return;
+      const ssid = document.getElementById('ssid').value;
+      if (new TextEncoder().encode(ssid).length > 32) {
+        tell('The Wi-Fi name must be no more than 32 bytes. Check the network name and try again.', true);
+        return;
+      }
+      busy = true;
+      button.disabled = true;
+      retry.disabled = true;
+      button.textContent = 'Connecting…';
+      tell('Sending the Wi-Fi details to your display…');
+      try {
+        const data = await request('/connect', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ssid, password: openNetwork.checked ? '' : password.value, csrf_token: csrfToken})
+        });
+        password.value = '';
+        tell(data.message || 'Details received. Your phone may disconnect now. Wait about two minutes; if the setup network returns, reconnect and retry.');
+      } catch (error) {
+        if (error.name === 'AbortError' || error instanceof TypeError) {
+          tell('The setup connection was lost. The display may be switching to your Wi-Fi. Wait about two minutes; if the setup network returns, reconnect and retry.');
+        } else {
+          tell(error.message, true);
+        }
+      } finally {
+        busy = false;
+        button.disabled = false;
+        retry.disabled = false;
+        button.textContent = 'Connect display';
+      }
+    });
+
+    retry.addEventListener('click', async () => {
+      if (busy) return;
+      busy = true;
+      button.disabled = true;
+      retry.disabled = true;
+      tell('Asking the display to try its saved Wi-Fi networks…');
+      try {
+        const data = await request('/retry', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({csrf_token: csrfToken})
+        });
+        tell(data.message || 'Trying saved Wi-Fi networks. Your phone may disconnect. Wait up to two minutes; if the setup network returns, reconnect to this page.');
+      } catch (error) {
+        if (error.name === 'AbortError' || error instanceof TypeError) {
+          tell('The setup connection was lost. Wait up to two minutes; if the setup network returns, reconnect to this page.');
+        } else {
+          tell(error.message, true);
+        }
+      } finally {
+        busy = false;
+        button.disabled = false;
+        retry.disabled = false;
+      }
+    });
+
+    request('/status').then(data => {
+      if (data.message) tell(data.message);
+    }).catch(() => {
+      tell('Connect your phone to BAPS-Signage-Setup, then reload this page.', true);
+    });
+  </script>
+</body>
+</html>
