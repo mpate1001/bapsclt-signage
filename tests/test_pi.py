@@ -98,6 +98,40 @@ def test_same_origin_redirect_only():
     assert redirect.redirect_request(request, None, 302, 'Redirect', {}, 'https://example.com/api/current').get_header('Authorization') == 'Bearer secret'
 
 
+def test_remote_metadata_and_video_send_player_identity(tmp_path):
+    data = b'video download'
+    description = metadata(data)
+    received = []
+
+    class Remote(agent.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            received.append((self.path, self.headers.get('User-Agent'), self.headers.get('Authorization')))
+            body = json.dumps(description).encode() if self.path == '/api/current' else data
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = agent.ThreadingHTTPServer(('127.0.0.1', 0), Remote)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        cache = agent.Cache(tmp_path, 'http://127.0.0.1:' + str(server.server_port), 'test-token')
+        assert cache.update()
+        assert received == [
+            ('/api/current', 'BAPSCLT-Signage/1.0', 'Bearer test-token'),
+            (description['video_url'], 'BAPSCLT-Signage/1.0', 'Bearer test-token'),
+        ]
+        assert cache.video_path(description['version']).read_bytes() == data
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
 @pytest.fixture
 def local_server(tmp_path):
     cache = agent.Cache(tmp_path / 'data', 'https://example.com', 'secret')

@@ -49,7 +49,8 @@ class Cache:
             return {'version': None}
 
     def _open(self, url):
-        return build_opener(SameOriginRedirect()).open(Request(url, headers={'Authorization': 'Bearer ' + self.token}), timeout=30)
+        headers = {'Authorization': 'Bearer ' + self.token, 'User-Agent': 'BAPSCLT-Signage/1.0'}
+        return build_opener(SameOriginRedirect()).open(Request(url, headers=headers), timeout=30)
 
     def _publish(self, version):
         fd, temporary = tempfile.mkstemp(prefix='.state-', dir=self.directory)
