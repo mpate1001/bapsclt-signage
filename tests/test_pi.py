@@ -172,3 +172,111 @@ def test_local_http_ranges_head_state_and_no_secrets(local_server):
         urlopen(Request(video, headers={'Range': 'bytes=15-20'}))
     assert caught.value.code == 416
     assert caught.value.headers['Content-Range'] == 'bytes */10'
+
+
+def test_device_json_requests_authenticated_and_bounded(tmp_path):
+    cache = agent.Cache(tmp_path, 'https://example.com', 'secret')
+    controls = agent.RemoteControls(cache, 'pi-01')
+    with patch.object(agent, 'build_opener') as opener:
+        opener.return_value.open.return_value.__enter__.return_value.read.return_value = b'{"ok":true}'
+        assert controls.request('/heartbeat', {'cached_version': None, 'reboot_supported': False}) == {'ok': True}
+        request = opener.return_value.open.call_args.args[0]
+        assert request.get_method() == 'POST'
+        assert request.get_header('Authorization') == 'Bearer secret'
+        assert request.get_header('User-agent') == 'BAPSCLT-Signage/1.0'
+        assert request.get_header('Content-type') == 'application/json'
+        assert json.loads(request.data)['cached_version'] is None
+        assert opener.return_value.open.call_args.kwargs['timeout'] == 30
+        assert isinstance(opener.call_args.args[0], agent.SameOriginRedirect)
+    with patch.object(cache, '_open', return_value=io.BytesIO(b'x' * 8193)):
+        with pytest.raises(ValueError, match='limit'):
+            controls.request('/commands')
+
+
+def test_heartbeat_tracks_cache_without_helper(tmp_path):
+    cache = agent.Cache(tmp_path, 'https://example.com', 'secret')
+    update(cache, b'cached')
+    controls = agent.RemoteControls(cache, 'pi-01')
+    with patch.object(controls, 'supported', return_value=False), patch.object(controls, 'request', return_value={'ok': True}) as request:
+        controls.sync()
+    request.assert_called_once_with('/heartbeat', {'cached_version': metadata(b'cached')['version'], 'reboot_supported': False})
+
+
+def test_reboot_ack_then_durable_history_prevents_replay(tmp_path):
+    cache = agent.Cache(tmp_path, 'https://example.com', 'secret')
+    controls = agent.RemoteControls(cache, 'pi-01')
+    command = {'id': 'abc-123', 'type': 'reboot', 'expires_at': agent.time.time() + 120}
+    def response(suffix, body=None):
+        if suffix.endswith('/ack'):
+            assert not controls.marker.exists()
+        return {'commands': [command]} if suffix == '/commands' else {'ok': True}
+    with patch.object(controls, 'supported', return_value=True), patch.object(controls, 'request', side_effect=response):
+        controls.sync()
+    assert controls.marker.read_text().strip() == command['id']
+    assert command['id'] in json.loads(controls.history_path.read_text())
+    controls.marker.unlink()  # Simulate fixed helper consuming request; never execute it.
+    restarted = agent.RemoteControls(cache, 'pi-01')
+    with patch.object(restarted, 'supported', return_value=True), patch.object(restarted, 'request', side_effect=response) as request:
+        restarted.sync()
+        assert request.call_count == 2
+    assert not restarted.marker.exists()
+
+
+@pytest.mark.parametrize('mutation', [
+    {'type': 'shell'}, {'expires_at': 0}, {'expires_at': True}, {'expires_at': float('inf')},
+    {'id': '../reboot'}, {'id': None}, {'expires_at': agent.time.time() + 99999},
+])
+def test_invalid_commands_never_ack_or_write(tmp_path, mutation):
+    controls = agent.RemoteControls(agent.Cache(tmp_path, 'https://example.com', 'secret'), 'pi-01')
+    command = {'id': 'safe-id', 'type': 'reboot', 'expires_at': agent.time.time() + 120} | mutation
+    with patch.object(controls, 'supported', return_value=True), patch.object(controls, 'request', side_effect=[{'ok': True}, {'commands': [command]}]) as request:
+        controls.sync()
+        assert request.call_count == 2
+    assert not controls.marker.exists()
+
+
+def test_failed_ack_and_stale_marker_never_reboot(tmp_path):
+    controls = agent.RemoteControls(agent.Cache(tmp_path, 'https://example.com', 'secret'), 'pi-01')
+    command = {'id': 'safe-id', 'type': 'reboot', 'expires_at': agent.time.time() + 120}
+    with patch.object(controls, 'supported', return_value=True), patch.object(controls, 'request', side_effect=[{'ok': True}, {'commands': [command]}, OSError('offline')]):
+        with pytest.raises(OSError):
+            controls.sync()
+    assert not controls.marker.exists()
+    assert not controls.history_path.exists()
+    controls.marker.write_text('stale')
+    with patch.object(controls, 'supported', return_value=True), patch.object(controls, 'request', side_effect=[{'ok': True}, {'commands': [command]}]) as request:
+        controls.sync()
+        assert request.call_count == 2
+    assert controls.marker.read_text() == 'stale'
+
+
+def test_control_failures_do_not_stop_poll_or_cached_playback(tmp_path):
+    cache = agent.Cache(tmp_path, 'https://example.com', 'secret')
+    update(cache, b'cached')
+    stop = threading.Event()
+    controls = agent.RemoteControls(cache, 'pi-01')
+    def failure():
+        stop.set()
+        raise OSError('offline')
+    with patch.object(cache, 'update', side_effect=OSError('offline')) as updater, patch.object(controls, 'sync', side_effect=failure):
+        agent.poll(cache, 1, stop, controls)
+    updater.assert_called_once()
+    assert cache.state()['version'] == metadata(b'cached')['version']
+
+
+def test_helper_capability_is_bounded_and_units_are_narrow(tmp_path):
+    controls = agent.RemoteControls(agent.Cache(tmp_path, 'https://example.com', 'secret'), 'pi-01')
+    with patch.object(agent.subprocess, 'run') as run:
+        run.return_value.returncode = 0
+        assert controls.supported()
+        assert run.call_args.args[0] == ['/usr/bin/systemctl', 'is-active', '--quiet', 'bapsclt-signage-reboot.path']
+        assert run.call_args.kwargs['timeout'] == 3
+    with patch.object(agent.subprocess, 'run', side_effect=agent.subprocess.TimeoutExpired('systemctl', 3)):
+        assert not controls.supported()
+    root = Path(__file__).resolve().parents[1] / 'pi/systemd'
+    assert 'PathExists=/home/admin/bapsclt-signage-data/reboot.request' in (root / 'bapsclt-signage-reboot.path').read_text()
+    unit = (root / 'bapsclt-signage-reboot.service').read_text()
+    assert 'ExecStartPre=/usr/bin/rm -f /home/admin/bapsclt-signage-data/reboot.request' in unit
+    assert 'ExecStart=/usr/bin/systemctl reboot' in unit
+    assert 'User=root' in unit
+    assert 'NoNewPrivileges=true' in (root / 'bapsclt-signage-agent.service').read_text()

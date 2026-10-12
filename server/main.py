@@ -5,10 +5,12 @@ import json
 import os
 import re
 import secrets
+import signal
+import sqlite3
 import subprocess
 import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -19,6 +21,12 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 VERSION = re.compile(r"^[a-f0-9]{64}$")
+DEVICE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def terminate_server():
+    """Only this process; Docker restart policy handles the container."""
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,7 @@ class Settings:
     cookie_secure: bool = True
     publisher_username: str = ""
     publisher_password: str = ""
+    allow_restart: bool = False
 
     def __post_init__(self):
         if bool(self.publisher_username.strip()) != bool(self.publisher_password.strip()):
@@ -54,10 +63,13 @@ class Settings:
         secure = os.environ.get("COOKIE_SECURE", "true").lower()
         if secure not in ("true", "false"):
             raise RuntimeError("COOKIE_SECURE must be true or false")
+        restart = os.environ.get("SIGNAGE_ALLOW_RESTART", "false").lower()
+        if restart not in ("true", "false"):
+            raise RuntimeError("SIGNAGE_ALLOW_RESTART must be true or false")
         return cls(values["ADMIN_USERNAME"], values["ADMIN_PASSWORD"], values["SESSION_SECRET"],
                    values["SIGNAGE_API_TOKEN"], Path(os.environ.get("DATA_DIR", "./data")),
                    limit, secure == "true", os.environ.get("PUBLISHER_USERNAME", ""),
-                   os.environ.get("PUBLISHER_PASSWORD", ""))
+                   os.environ.get("PUBLISHER_PASSWORD", ""), restart == "true")
 
 
 def validate_video(path: Path):
@@ -89,6 +101,45 @@ def create_app(settings=None):
     media_dir = settings.data_dir / "videos"
     manifest_path = settings.data_dir / "current.json"
     upload_lock = asyncio.Lock()
+    database_path = settings.data_dir / "devices.sqlite3"
+
+    @contextmanager
+    def database():
+        connection = sqlite3.connect(database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def prune(db, now):
+        db.execute("UPDATE commands SET status='expired' WHERE status='pending' AND expires_at<=?", (now,))
+        db.execute("DELETE FROM commands WHERE status!='pending' AND expires_at<?", (now - 86400,))
+        db.execute("DELETE FROM devices WHERE last_seen<? AND id NOT IN (SELECT device_id FROM commands WHERE status='pending')", (now - 30 * 86400,))
+
+    def devices(db, now):
+        return [{**dict(row), "online": now - row["last_seen"] <= 90,
+                 "reboot_supported": bool(row["reboot_supported"])}
+                for row in db.execute("SELECT * FROM devices ORDER BY id")]
+
+    async def device_json(request):
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 8192:
+                raise HTTPException(413, "Device request too large.")
+        try:
+            item = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(400, "Invalid device JSON.")
+        if not isinstance(item, dict):
+            raise HTTPException(400, "Expected a JSON object.")
+        return item
+
+    def check_device_id(device_id):
+        if not DEVICE_ID.fullmatch(device_id):
+            raise HTTPException(400, "Invalid device ID.")
     # Global limit avoids trusting reverse-proxy client IP headers. Single worker required.
     login_failures = []
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -96,9 +147,33 @@ def create_app(settings=None):
     @asynccontextmanager
     async def lifespan(_):
         media_dir.mkdir(parents=True, exist_ok=True)
-        yield
+        with database() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS devices (
+                    id TEXT PRIMARY KEY, last_seen REAL NOT NULL,
+                    cached_version TEXT, reboot_supported INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS commands (
+                    id TEXT PRIMARY KEY, device_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL, status TEXT NOT NULL);
+                CREATE UNIQUE INDEX IF NOT EXISTS one_pending_command
+                    ON commands(device_id) WHERE status='pending';
+            """)
+        app.state.started_at = time.monotonic()
+        app.state.restart_task = None
+        try:
+            yield
+        finally:
+            task = app.state.restart_task
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.instance_id = secrets.token_hex(16)
+    app.state.upload_lock = upload_lock
     app.add_middleware(SessionMiddleware, secret_key=settings.session_secret,
                        session_cookie="signage_session", max_age=8 * 3600,
                        same_site="strict", https_only=settings.cookie_secure)
@@ -197,6 +272,8 @@ def create_app(settings=None):
         return templates.TemplateResponse(request=request, name="admin.html", context={
             "authenticated": role is not None, "csrf": csrf(request),
             "max_upload_mb": settings.max_upload_mb, "portal_path": portal_path,
+            "admin_controls": portal_path == "/admin" and role == "admin",
+            "allow_restart": settings.allow_restart,
             "portal_title": "Signage admin" if portal_path == "/admin" else "Upload portal",
         })
 
@@ -254,6 +331,8 @@ def create_app(settings=None):
             raise HTTPException(400, "Invalid content length.")
         if declared_size > max_bytes:
             raise HTTPException(413, "Video exceeds the upload limit.")
+        if app.state.restart_task is not None:
+            raise HTTPException(409, "Server restart is scheduled. Try again after it restarts.")
         if upload_lock.locked():
             raise HTTPException(409, "Another upload is publishing. Try again shortly.")
         async with upload_lock:
@@ -291,6 +370,149 @@ def create_app(settings=None):
                 temporary.unlink(missing_ok=True)
                 if manifest_tmp:
                     manifest_tmp.unlink(missing_ok=True)
+
+    def check_admin(request, mutation=False):
+        check_portal(request)
+        if session_role(request) != "admin":
+            raise HTTPException(403, "Admin access required.")
+        if mutation:
+            check_csrf(request, request.headers.get("x-csrf-token"))
+
+    @app.get("/admin/status")
+    async def admin_status(request: Request):
+        check_admin(request)
+        return {"instance": app.state.instance_id}
+
+    @app.get("/admin/devices")
+    async def admin_devices(request: Request):
+        check_admin(request)
+        now = time.time()
+        with database() as db:
+            prune(db, now)
+            return {"devices": devices(db, now)}
+
+    @app.get("/admin/library")
+    async def library(request: Request):
+        check_admin(request)
+        async with upload_lock:
+            current_version = current()["version"]
+            with database() as db:
+                inventory = devices(db, time.time())
+            videos = []
+            for path in media_dir.glob("*.mp4"):
+                if not VERSION.fullmatch(path.stem) or path.is_symlink() or not path.is_file():
+                    continue
+                stat = path.stat()
+                videos.append({"version": path.stem, "size": stat.st_size,
+                               "created_at": stat.st_mtime, "is_current": path.stem == current_version,
+                               "in_use_by": [d["id"] for d in inventory if d["online"] and d["cached_version"] == path.stem]})
+            return {"videos": sorted(videos, key=lambda v: v["created_at"], reverse=True)}
+
+    @app.post("/admin/videos/{version}/delete")
+    async def delete_video(request: Request, version: str):
+        check_admin(request, mutation=True)
+        if not VERSION.fullmatch(version):
+            raise HTTPException(400, "Invalid video version.")
+        async with upload_lock:
+            if current()["version"] == version:
+                raise HTTPException(409, "The published video cannot be deleted.")
+            with database() as db:
+                if any(d["online"] and d["cached_version"] == version for d in devices(db, time.time())):
+                    raise HTTPException(409, "An online device is using this video.")
+            path = media_dir / (version + ".mp4")
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Video version not found.")
+            path.unlink()
+            return {"ok": True}
+
+    @app.post("/api/devices/{device_id}/heartbeat")
+    async def heartbeat(request: Request, device_id: str):
+        check_token(request)
+        check_device_id(device_id)
+        item = await device_json(request)
+        version = item.get("cached_version")
+        supported = item.get("reboot_supported")
+        if (set(item) != {"cached_version", "reboot_supported"}
+                or (version is not None and (not isinstance(version, str) or not VERSION.fullmatch(version)))
+                or not isinstance(supported, bool)):
+            raise HTTPException(400, "Invalid heartbeat fields.")
+        # Shares publication/deletion lock so cached-video protection cannot race deletion.
+        async with upload_lock:
+            now = time.time()
+            with database() as db:
+                prune(db, now)
+                if not db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone():
+                    if db.execute("SELECT COUNT(*) FROM devices").fetchone()[0] >= 100:
+                        raise HTTPException(409, "Device inventory is full.")
+                db.execute("INSERT INTO devices VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, cached_version=excluded.cached_version, reboot_supported=excluded.reboot_supported",
+                           (device_id, now, version, supported))
+        return {"ok": True}
+
+    @app.post("/admin/devices/{device_id}/reboot")
+    async def reboot_device(request: Request, device_id: str):
+        check_admin(request, mutation=True)
+        check_device_id(device_id)
+        now = time.time()
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prune(db, now)
+            device = db.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+            if not device:
+                raise HTTPException(404, "Device not found.")
+            if now - device["last_seen"] > 90 or not device["reboot_supported"]:
+                raise HTTPException(409, "Device is offline or reboot is unavailable.")
+            existing = db.execute("SELECT id FROM commands WHERE device_id=? AND status='pending'", (device_id,)).fetchone()
+            if existing:
+                return {"command_id": existing["id"], "status": "queued"}
+            if db.execute("SELECT COUNT(*) FROM commands").fetchone()[0] >= 1000:
+                raise HTTPException(409, "Command inventory is full. Try again later.")
+            command_id = secrets.token_hex(16)
+            db.execute("INSERT INTO commands VALUES (?, ?, ?, 'pending')", (command_id, device_id, now + 300))
+            return {"command_id": command_id, "status": "queued"}
+
+    @app.get("/api/devices/{device_id}/commands")
+    async def pending_commands(request: Request, device_id: str):
+        check_token(request)
+        check_device_id(device_id)
+        with database() as db:
+            prune(db, time.time())
+            if not db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone():
+                raise HTTPException(404, "Device not found.")
+            return {"commands": [{"id": row["id"], "type": "reboot", "expires_at": row["expires_at"]}
+                                 for row in db.execute("SELECT id, expires_at FROM commands WHERE device_id=? AND status='pending'", (device_id,))]}
+
+    @app.post("/api/devices/{device_id}/commands/{command_id}/ack")
+    async def acknowledge(request: Request, device_id: str, command_id: str):
+        check_token(request)
+        check_device_id(device_id)
+        if not re.fullmatch(r"[a-f0-9]{32}", command_id):
+            raise HTTPException(400, "Invalid command ID.")
+        if await device_json(request) != {}:
+            raise HTTPException(400, "Expected an empty acknowledgment object.")
+        with database() as db:
+            updated = db.execute("UPDATE commands SET status='acknowledged' WHERE id=? AND device_id=? AND status='pending' AND expires_at>?",
+                                 (command_id, device_id, time.time()))
+            if updated.rowcount != 1:
+                raise HTTPException(409, "Command is unavailable or already acknowledged.")
+        return {"ok": True}
+
+    @app.post("/admin/restart")
+    async def restart(request: Request):
+        check_admin(request, mutation=True)
+        if not settings.allow_restart:
+            raise HTTPException(403, "Server restart is disabled.")
+        if upload_lock.locked():
+            raise HTTPException(409, "An upload is publishing. Try again shortly.")
+        if app.state.restart_task is not None:
+            raise HTTPException(409, "Server restart is already scheduled.")
+
+        async def delayed_restart():
+            # Docker activates restart policy after the container has run for ten seconds.
+            await asyncio.sleep(max(1, 11 - (time.monotonic() - app.state.started_at)))
+            terminate_server()
+
+        app.state.restart_task = asyncio.create_task(delayed_restart())
+        return {"status": "restarting", "instance": app.state.instance_id}
 
     @app.get("/api/current")
     async def api_current(request: Request):

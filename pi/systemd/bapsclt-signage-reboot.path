@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a BAPS signage device reboot request
+
+[Path]
+PathExists=/home/admin/bapsclt-signage-data/reboot.request
+Unit=bapsclt-signage-reboot.service
+
+[Install]
+WantedBy=multi-user.target

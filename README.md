@@ -80,6 +80,60 @@ Docker stores media in a named volume that survives container rebuilds. Back up
 that volume. Do not use `docker compose down -v` unless you intend to erase it.
 Keep one server process/replica, as configured, to serialize publication.
 
+## Admin management
+
+The administrator's `/admin` page includes a video library, device status, and
+separate controls to reboot a Pi or restart the signage server. Publisher accounts
+only see upload/publish controls on `/upload`.
+
+The library lists retained videos with previews, sizes, and publication status.
+Deleting a video requires confirmation. The currently published video and videos
+cached by online devices are protected from deletion. Older files are retained
+until the administrator deletes them; uploads do not automatically remove them.
+
+Devices report their cached video and last check-in. A recent check-in means the
+agent is online; it does not prove the TV is rendering frames. Devices without the
+reboot helper installed are shown without an available reboot action. Requests
+expire after five minutes and are acknowledged before the Pi triggers a reboot.
+
+To allow **Restart signage server**, set `SIGNAGE_ALLOW_RESTART=true` in the server
+environment and retain `restart: unless-stopped` (or `always`) in Compose. For the
+TrueNAS Apps installation, add `SIGNAGE_ALLOW_RESTART: 'true'` under the existing
+service `environment` section and save the updated application. Keep this option
+false for local development without a restart supervisor.
+
+This action gracefully ends the signage process so Docker starts it again using
+the already deployed image. It affects only the signage container. Updating code
+still requires pulling GitHub changes, rebuilding the image, and redeploying the
+application. Cached Pi playback continues while the server restarts.
+
+### Enable the Pi reboot control
+
+Update the Pi checkout and restart its agent to enable heartbeat/status reporting.
+The existing API token is used; no new token is needed. `SIGNAGE_DEVICE_ID` is an
+optional stable device name; when omitted or empty, the Pi's hostname is used.
+
+Install the narrow systemd reboot helper from the Pi checkout. The default paths
+assume `/home/admin/bapsclt-signage-data` is already created. If you use a different
+`SIGNAGE_DATA_DIR`, update the path in both helper units to match before installing.
+
+```sh
+sudo install -m 644 pi/systemd/bapsclt-signage-reboot.service /etc/systemd/system/
+sudo install -m 644 pi/systemd/bapsclt-signage-reboot.path /etc/systemd/system/
+sudo rm -f /home/admin/bapsclt-signage-data/reboot.request
+sudo systemctl daemon-reload
+sudo systemctl enable --now bapsclt-signage-reboot.path
+sudo systemctl restart bapsclt-signage-agent.service
+```
+
+The removal command clears only a stale reboot-request marker before activation.
+The agent remains unprivileged and writes a marker only for an acknowledged,
+unexpired reboot command. The root helper removes that marker before invoking the
+fixed system reboot command. It provides no general remote shell execution.
+
+Test these controls during a suitable maintenance window: a Pi reboot briefly
+interrupts that display, and a server restart briefly interrupts the upload portal.
+
 ## Shared publisher account
 
 Enable an optional publisher account with `PUBLISHER_USERNAME` and
@@ -235,8 +289,8 @@ Immutable version URLs prevent a download from mixing two publications. Public
 playback uses `/public/current` and `/public/video?version=<sha256>`.
 
 Older immutable video files are retained to keep ongoing playback/downloads
-stable. Monitor disk usage and plan manual retention maintenance after backing up;
-this release does not automatically delete published media.
+stable. Monitor disk usage and delete unused videos through the administrator
+library after backing up; this release does not automatically delete published media.
 
 References: [Docker Compose environment files](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/)
 and [build paths](https://docs.docker.com/reference/compose-file/build/).

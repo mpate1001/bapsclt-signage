@@ -1,0 +1,8 @@
+[Unit]
+Description=Execute a fixed BAPS signage device reboot
+
+[Service]
+Type=oneshot
+User=root
+ExecStartPre=/usr/bin/rm -f /home/admin/bapsclt-signage-data/reboot.request
+ExecStart=/usr/bin/systemctl reboot

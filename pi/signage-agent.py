@@ -3,8 +3,12 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import socket
+import subprocess
+import time
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +18,7 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 LOG = logging.getLogger('signage')
 VERSION = re.compile(r'[0-9a-f]{64}\Z')
+IDENTITY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z')
 
 class SameOriginRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
@@ -48,9 +53,11 @@ class Cache:
                 pass
             return {'version': None}
 
-    def _open(self, url):
+    def _open(self, url, data=None):
         headers = {'Authorization': 'Bearer ' + self.token, 'User-Agent': 'BAPSCLT-Signage/1.0'}
-        return build_opener(SameOriginRedirect()).open(Request(url, headers=headers), timeout=30)
+        if data is not None:
+            headers['Content-Type'] = 'application/json'
+        return build_opener(SameOriginRedirect()).open(Request(url, data=data, headers=headers), timeout=30)
 
     def _publish(self, version):
         fd, temporary = tempfile.mkstemp(prefix='.state-', dir=self.directory)
@@ -114,6 +121,108 @@ class Cache:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+
+class RemoteControls:
+    """Fixed reboot request only; privileged execution belongs to the path helper."""
+    def __init__(self, cache, device_id):
+        if not isinstance(device_id, str) or not IDENTITY.fullmatch(device_id):
+            raise ValueError('Invalid device identity')
+        self.cache = cache
+        self.endpoint = cache.base_url + '/api/devices/' + device_id
+        self.history_path = cache.directory / 'handled-commands.json'
+        self.marker = cache.directory / 'reboot.request'
+
+    def supported(self):
+        try:
+            return subprocess.run(
+                ['/usr/bin/systemctl', 'is-active', '--quiet', 'bapsclt-signage-reboot.path'],
+                timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def request(self, suffix, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        if data is not None and len(data) > 8192:
+            raise ValueError('Request exceeds limit')
+        with self.cache._open(self.endpoint + suffix, data=data) as response:
+            raw = response.read(8193)
+        if len(raw) > 8192:
+            raise ValueError('Response exceeds limit')
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError('Invalid response')
+        return result
+
+    def _handled(self):
+        try:
+            if self.history_path.stat().st_size > 131072:
+                raise ValueError('History exceeds limit')
+            history = json.loads(self.history_path.read_text())
+        except FileNotFoundError:
+            return {}
+        if not isinstance(history, dict) or len(history) > 1024:
+            raise ValueError('Invalid command history')
+        for identity, expiry in history.items():
+            if not IDENTITY.fullmatch(identity) or type(expiry) not in (int, float) or not math.isfinite(expiry):
+                raise ValueError('Invalid command history')
+        return {identity: expiry for identity, expiry in history.items() if expiry > time.time()}
+
+    def _record(self, history):
+        fd, temporary = tempfile.mkstemp(prefix='.commands-', dir=self.cache.directory)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                json.dump(history, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.history_path)
+            directory_fd = os.open(self.cache.directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def sync(self):
+        supported = self.supported()
+        if self.request('/heartbeat', {
+            'cached_version': self.cache.state()['version'], 'reboot_supported': supported
+        }).get('ok') is not True:
+            raise ValueError('Heartbeat refused')
+        if not supported:
+            return
+        commands = self.request('/commands').get('commands')
+        if not isinstance(commands, list) or len(commands) > 32:
+            raise ValueError('Invalid commands')
+        history = self._handled()
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            identity, expiry = command.get('id'), command.get('expires_at')
+            if (command.get('type') != 'reboot' or not isinstance(identity, str)
+                    or not IDENTITY.fullmatch(identity) or type(expiry) not in (int, float)
+                    or not math.isfinite(expiry) or not time.time() < expiry <= time.time() + 360
+                    or identity in history or len(history) >= 1024):
+                continue
+            # A stale marker is never overwritten or treated as a new request.
+            if self.marker.exists() or self.marker.is_symlink():
+                return
+            if self.request('/commands/' + identity + '/ack', {}).get('ok') is not True:
+                raise ValueError('Acknowledgement refused')
+            history[identity] = expiry
+            self._record(history)
+            if time.time() >= expiry:
+                return
+            # Exclusive creation plus durable bookkeeping prevents replay after restart.
+            with self.marker.open('x') as marker:
+                marker.write(identity + '\n')
+                marker.flush()
+                os.fsync(marker.fileno())
+            LOG.info('Acknowledged device reboot request')
+            return
 
 
 def handler_for(cache, index_path):
@@ -198,7 +307,7 @@ def handler_for(cache, index_path):
     return Handler
 
 
-def poll(cache, interval, stop):
+def poll(cache, interval, stop, controls=None):
     while not stop.is_set():
         try:
             if cache.update():
@@ -206,6 +315,11 @@ def poll(cache, interval, stop):
         except Exception as error:
             # Log type only: remote errors/request objects may contain secrets.
             LOG.warning('Remote update failed (%s); keeping cached video', type(error).__name__)
+        if controls is not None:
+            try:
+                controls.sync()
+            except Exception as error:
+                LOG.warning('Device controls failed (%s); playback continues', type(error).__name__)
         stop.wait(interval)
 
 
@@ -223,10 +337,11 @@ def main():
         raise SystemExit('SIGNAGE_POLL_SECONDS must be at least 1')
     cache = Cache(os.environ.get('SIGNAGE_DATA_DIR', '/home/admin/bapsclt-signage-data'), base_url, token,
                   int(os.environ.get('SIGNAGE_MAX_VIDEO_BYTES', '2000000000')))
+    controls = RemoteControls(cache, os.environ.get('SIGNAGE_DEVICE_ID') or socket.gethostname())
     server = ThreadingHTTPServer(('127.0.0.1', 8090), handler_for(cache, Path(__file__).with_name('index.html')))
     server.daemon_threads = True
     stop = threading.Event()
-    threading.Thread(target=poll, args=(cache, interval, stop), daemon=True).start()
+    threading.Thread(target=poll, args=(cache, interval, stop, controls), daemon=True).start()
     LOG.info('Local player available at http://127.0.0.1:8090/index.html')
     try:
         server.serve_forever()

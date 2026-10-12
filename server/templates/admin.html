@@ -10,13 +10,20 @@
     p{line-height:1.6;color:#4d6267}.panel{background:white;border:1px solid #d7e0de;border-radius:14px;padding:28px;margin-top:28px}
     label{display:block;font-weight:600;margin:20px 0 8px}input{width:100%;padding:12px;border:1px solid #a0b6b2;border-radius:6px;font:inherit}
     button,.link{display:inline-block;padding:12px 18px;border-radius:6px;border:0;background:#1b6258;color:white;font:inherit;font-weight:600;cursor:pointer;text-decoration:none;margin-top:20px}
-    button:disabled{opacity:.6;cursor:wait}.secondary{background:#e6edeb;color:#244c45}a{color:#1b6258}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #cf8038;outline-offset:3px}
+    button:disabled{opacity:.6;cursor:not-allowed}.secondary{background:#e6edeb;color:#244c45}a{color:#1b6258}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #cf8038;outline-offset:3px}
     #status{min-height:24px;margin-top:18px;white-space:pre-wrap}progress{display:block;width:100%;margin-top:18px;accent-color:#1b6258}.hint{font-size:14px}
+    main.dashboard{max-width:1080px;margin-top:5vh}.dashboard-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}.dashboard-grid .panel{margin-top:24px;min-width:0}
+    .wide{grid-column:1/-1}h2{font-size:21px;margin:0 0 12px}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.panel-heading button{margin:0}
+    .inventory{padding:0;list-style:none;margin:16px 0 0}.inventory li{border-top:1px solid #e6edeb;padding:18px 0;display:flex;justify-content:space-between;align-items:center;gap:18px}.inventory li:last-child{padding-bottom:0}
+    .inventory button{margin:0;flex-shrink:0}.item-title{font-weight:650;overflow-wrap:anywhere}.item-details{font-size:14px;line-height:1.6;color:#4d6267;margin-top:5px;overflow-wrap:anywhere}
+    .badge{display:inline-block;border-radius:4px;background:#e6edeb;color:#244c45;padding:2px 7px;font-size:12px;margin-right:8px}.badge.offline{background:#f1ece3;color:#795329}
+    .danger{background:#8e3535}.version{font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}.management-status{min-height:24px;white-space:pre-wrap}.empty{font-size:14px;color:#4d6267}
     @media(max-width:600px){main{margin:24px auto;padding:18px}.panel{padding:20px}}
+    @media(max-width:800px){.dashboard-grid{grid-template-columns:1fr}.inventory li{align-items:flex-start;flex-direction:column}.inventory button{margin-top:4px}main.dashboard{margin-top:24px}}
   </style>
 </head>
 <body>
-<main>
+<main{% if admin_controls %} class="dashboard"{% endif %}>
   <div class="brand">BAPS CHARLOTTE</div>
   <h1>{{ portal_title }}</h1>
   <p>Publish the video shown on your displays.</p>
@@ -47,6 +54,29 @@
     <p id="status" role="status" aria-live="polite"></p>
   {% endif %}
   </section>
+  {% if admin_controls %}
+  <div class="dashboard-grid">
+    <section class="panel wide" aria-labelledby="devices-title">
+      <div class="panel-heading"><h2 id="devices-title">Signage devices</h2><button class="secondary" id="refresh-controls" type="button">Refresh status</button></div>
+      <p class="hint">Online means the update agent checked in recently. The cached version shows which video it downloaded; it does not confirm what is playing on the TV.</p>
+      <ul id="device-list" class="inventory" aria-label="Signage devices"></ul>
+      <p id="device-status" role="status" aria-live="polite" class="management-status">Loading devices…</p>
+    </section>
+    <section class="panel" aria-labelledby="library-title">
+      <h2 id="library-title">Video library</h2>
+      <p class="hint">Remove unused videos to free storage. The current video and videos cached by online devices are protected.</p>
+      <ul id="video-list" class="inventory" aria-label="Stored videos"></ul>
+      <p id="library-status" role="status" aria-live="polite" class="management-status">Loading videos…</p>
+    </section>
+    <section class="panel" aria-labelledby="server-title">
+      <h2 id="server-title">Signage server</h2>
+      <p class="hint">Restart the signage container if the portal needs recovery. Uploads and online viewing pause briefly. Pi devices continue using their cached video.</p>
+      <button id="restart-server" class="danger" type="button"{% if not allow_restart %} disabled{% endif %}>Restart signage server</button>
+      {% if not allow_restart %}<p class="hint">Server restart is disabled in the server configuration.</p>{% endif %}
+      <p id="server-status" role="status" aria-live="polite" class="management-status"></p>
+    </section>
+  </div>
+  {% endif %}
 </main>
 <script>
 const csrf = {{ csrf | tojson }};
@@ -60,6 +90,7 @@ document.getElementById('upload-form').addEventListener('submit', event => {
   if (!file) return;
   if (file.size > {{ max_upload_mb }} * 1024 * 1024) {status.textContent = 'Video exceeds the upload limit.'; return;}
   publish.disabled = true; progress.hidden = false; progress.value = 0;
+  {% if admin_controls %}restartButton.disabled = true;{% endif %}
   status.textContent = 'Uploading video…';
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '{{ portal_path }}/upload');
@@ -71,12 +102,18 @@ document.getElementById('upload-form').addEventListener('submit', event => {
   };
   xhr.onload = () => {
     publish.disabled = false;
+    {% if admin_controls %}restartButton.disabled = actionBusy || !restartAllowed;{% endif %}
     let result = {}; try {result = JSON.parse(xhr.responseText);} catch (_) {}
     status.textContent = xhr.status >= 200 && xhr.status < 300
       ? 'Published. Displays will update shortly.'
       : (result.detail || 'Upload failed. The previously published video is preserved.');
+    {% if admin_controls %}if (xhr.status >= 200 && xhr.status < 300) refreshControls();{% endif %}
   };
-  xhr.onerror = () => {publish.disabled = false; status.textContent = 'Connection lost. Check the display before retrying.';};
+  xhr.onerror = () => {
+    publish.disabled = false;
+    {% if admin_controls %}restartButton.disabled = actionBusy || !restartAllowed;{% endif %}
+    status.textContent = 'Connection lost. Check the display before retrying.';
+  };
   xhr.send(file);
 });
 document.getElementById('logout').addEventListener('click', async () => {
@@ -85,6 +122,150 @@ document.getElementById('logout').addEventListener('click', async () => {
     if (response.ok) location.assign({{ portal_path | tojson }}); else status.textContent = 'Refresh the page and try signing out again.';
   } catch (_) {status.textContent = 'Connection lost. Try signing out again.';}
 });
+{% if admin_controls %}
+const deviceList = document.getElementById('device-list');
+const videoList = document.getElementById('video-list');
+const deviceStatus = document.getElementById('device-status');
+const libraryStatus = document.getElementById('library-status');
+const serverStatus = document.getElementById('server-status');
+const restartButton = document.getElementById('restart-server');
+const restartAllowed = {{ allow_restart | tojson }};
+let actionBusy = false;
+let refreshBusy = false;
+let devices = [];
+let videos = [];
+
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+function timestamp(value) {
+  return value ? new Date(value * 1000).toLocaleString() : 'Unknown';
+}
+function formatSize(bytes) {
+  return bytes >= 1024 * 1024 * 1024 ? (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB'
+    : (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+async function request(path, method = 'GET') {
+  const response = await fetch(path, {
+    method, cache:'no-store', signal:AbortSignal.timeout(10000),
+    headers:method === 'POST' ? {'X-CSRF-Token':csrf} : {}
+  });
+  let result = {}; try {result = await response.json();} catch (_) {}
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) throw new Error('Your admin session is unavailable. Refresh and sign in again.');
+    throw new Error(typeof result.detail === 'string' ? result.detail : 'Request failed. Refresh status and try again.');
+  }
+  return result;
+}
+function renderDevices() {
+  deviceList.replaceChildren();
+  if (!devices.length) deviceList.append(element('li', 'No devices have checked in yet.', 'empty'));
+  devices.forEach(device => {
+    const row = element('li');
+    const info = element('div');
+    const title = element('div', undefined, 'item-title');
+    title.append(element('span', device.online ? 'Online' : 'Offline', 'badge' + (device.online ? '' : ' offline')), element('span', device.id));
+    info.append(title, element('div', 'Last check-in: ' + timestamp(device.last_seen), 'item-details'));
+    info.append(element('div', 'Cached version: ' + (device.cached_version || 'No video cached'), 'item-details version'));
+    if (!device.reboot_supported) info.append(element('div', 'Reboot helper is not active on this device.', 'item-details'));
+    const button = element('button', 'Reboot Pi', 'secondary');
+    button.type = 'button'; button.disabled = actionBusy || !device.online || !device.reboot_supported;
+    button.setAttribute('aria-label', 'Reboot Pi ' + device.id);
+    button.addEventListener('click', () => rebootDevice(device));
+    row.append(info, button); deviceList.append(row);
+  });
+}
+function renderVideos() {
+  videoList.replaceChildren();
+  if (!videos.length) videoList.append(element('li', 'No videos stored yet.', 'empty'));
+  videos.forEach(video => {
+    const row = element('li'); const info = element('div');
+    info.append(element('div', video.is_current ? 'Current video' : 'Stored video', 'item-title'));
+    info.append(element('div', video.version, 'item-details version'));
+    info.append(element('div', formatSize(video.size) + ' · Stored ' + timestamp(video.created_at), 'item-details'));
+    if (video.in_use_by.length) info.append(element('div', 'Cached by online devices: ' + video.in_use_by.join(', '), 'item-details'));
+    const preview = element('a', 'Preview video');
+    preview.href = '/public/video?version=' + encodeURIComponent(video.version);
+    preview.target = '_blank'; preview.rel = 'noopener';
+    preview.setAttribute('aria-label', 'Preview stored video ' + video.version + ' (opens in a new tab)');
+    info.append(preview);
+    const button = element('button', 'Delete', 'secondary'); button.type = 'button';
+    button.disabled = actionBusy || video.is_current || video.in_use_by.length > 0;
+    button.setAttribute('aria-label', 'Delete stored video ' + video.version);
+    button.addEventListener('click', () => deleteVideo(video));
+    row.append(info, button); videoList.append(row);
+  });
+}
+function setBusy(value) {
+  actionBusy = value; restartButton.disabled = value || publish.disabled || !restartAllowed;
+  document.getElementById('refresh-controls').disabled = value;
+  renderDevices(); renderVideos();
+}
+async function refreshControls() {
+  if (refreshBusy || actionBusy) return;
+  refreshBusy = true;
+  await Promise.all([
+    request('/admin/devices').then(result => {
+      devices = result.devices; renderDevices(); deviceStatus.textContent = '';
+    }).catch(error => {deviceStatus.textContent = 'Device status could not refresh. ' + error.message;}),
+    request('/admin/library').then(result => {
+      videos = result.videos; renderVideos(); libraryStatus.textContent = '';
+    }).catch(error => {libraryStatus.textContent = 'Video library could not refresh. ' + error.message;})
+  ]);
+  refreshBusy = false;
+}
+async function rebootDevice(device) {
+  if (actionBusy || !confirm('Reboot Pi ' + device.id + '? Its display will stop until startup finishes.')) return;
+  setBusy(true);
+  try {
+    await request('/admin/devices/' + encodeURIComponent(device.id) + '/reboot', 'POST');
+    deviceStatus.textContent = 'Reboot queued for ' + device.id + '. The agent will pick it up on its next check-in.';
+  } catch (error) {deviceStatus.textContent = error.message;}
+  setBusy(false);
+}
+async function deleteVideo(video) {
+  if (actionBusy || !confirm('Permanently delete this unused video (' + formatSize(video.size) + ')? This cannot be undone.')) return;
+  setBusy(true);
+  let deleted = false;
+  try {
+    await request('/admin/videos/' + encodeURIComponent(video.version) + '/delete', 'POST');
+    deleted = true;
+  } catch (error) {libraryStatus.textContent = error.message;}
+  setBusy(false);
+  if (deleted) {await refreshControls(); libraryStatus.textContent = 'Unused video deleted.';}
+}
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+restartButton.addEventListener('click', async () => {
+  if (actionBusy || publish.disabled || !restartAllowed || !confirm('Restart the signage server? Uploads and online viewing will pause briefly.')) return;
+  setBusy(true); publish.disabled = true;
+  try {
+    const result = await request('/admin/restart', 'POST');
+    if (result.status !== 'restarting' || typeof result.instance !== 'string') throw new Error('Restart was not confirmed. Refresh status before retrying.');
+    serverStatus.textContent = 'Restart requested. Waiting for the server to reconnect…';
+    await delay(2500);
+    const deadline = Date.now() + 60000;
+    let connected = false;
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch('/admin/status', {cache:'no-store', signal:AbortSignal.timeout(5000)});
+        if (response.ok) {
+          const current = await response.json();
+          if (typeof current.instance === 'string' && current.instance !== result.instance) {connected = true; break;}
+        }
+      } catch (_) {}
+      await delay(2000);
+    }
+    serverStatus.textContent = connected ? 'Server restarted and is responding again.' : 'A restarted server has not been confirmed yet. Check the app status in TrueNAS, then refresh this page.';
+  } catch (error) {serverStatus.textContent = error.message;}
+  publish.disabled = false; setBusy(false); await refreshControls();
+});
+document.getElementById('refresh-controls').addEventListener('click', refreshControls);
+refreshControls();
+setInterval(refreshControls, 15000);
+{% endif %}
 {% else %}
 document.getElementById('login-form').addEventListener('submit', async event => {
   event.preventDefault();
