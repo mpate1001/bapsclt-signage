@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BAPS Charlotte Signage</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#ddd;font:20px system-ui}
+video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:#000}
+video.pending{visibility:hidden}#message{position:fixed;inset:0;display:grid;place-items:center;text-align:center}
+</style>
+<div id="message" role="status">Waiting for the first video</div>
+<script>
+(() => {
+  let current = null, currentVersion = null, pending = null;
+  const message = document.getElementById('message');
+  async function check() {
+    try {
+      const response = await fetch('/state.json', {cache:'no-store'});
+      if (!response.ok) throw new Error('state unavailable');
+      const state = await response.json();
+      if (typeof state.version !== 'string' || !/^[a-f0-9]{64}$/.test(state.version) || state.version === currentVersion || pending) return;
+      const next = document.createElement('video');
+      next.className = 'pending'; next.autoplay = true; next.muted = true;
+      next.loop = true; next.playsInline = true; next.preload = 'auto'; pending = next;
+      const timeout = setTimeout(failed, 60000);
+      function failed() {
+        clearTimeout(timeout); if (pending === next) pending = null;
+        next.pause(); next.removeAttribute('src'); next.load(); next.remove();
+      }
+      next.addEventListener('error', failed, {once:true});
+      next.addEventListener('canplay', async () => {
+        try { await next.play(); } catch { failed(); return; }
+        clearTimeout(timeout); if (pending !== next) return;
+        const previous = current;
+        current = next; currentVersion = state.version; pending = null;
+        next.className = ''; message.style.display = 'none';
+        if (previous) { previous.pause(); previous.removeAttribute('src'); previous.load(); previous.remove(); }
+        next.addEventListener('error', () => { currentVersion = null; }, {once:true});
+      }, {once:true});
+      next.src = '/video?version=' + state.version; document.body.append(next);
+    } catch { /* Keep cached playback while the agent is unavailable. */ }
+  }
+  check(); setInterval(check, 5000);
+})();
+</script></html>

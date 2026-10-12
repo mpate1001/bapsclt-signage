@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BAPS CLT · Signage admin</title>
+  <style>
+    :root{color-scheme:light;font-family:system-ui,sans-serif;color:#172a31;background:#edf1f0}
+    *{box-sizing:border-box}[hidden]{display:none!important}body{margin:0}main{max-width:680px;margin:8vh auto;padding:24px}
+    .brand{font-size:13px;letter-spacing:.12em;font-weight:700;color:#426763}h1{font-size:32px;letter-spacing:-.03em;margin:16px 0 8px}
+    p{line-height:1.6;color:#4d6267}.panel{background:white;border:1px solid #d7e0de;border-radius:14px;padding:28px;margin-top:28px}
+    label{display:block;font-weight:600;margin:20px 0 8px}input{width:100%;padding:12px;border:1px solid #a0b6b2;border-radius:6px;font:inherit}
+    button,.link{display:inline-block;padding:12px 18px;border-radius:6px;border:0;background:#1b6258;color:white;font:inherit;font-weight:600;cursor:pointer;text-decoration:none;margin-top:20px}
+    button:disabled{opacity:.6;cursor:wait}.secondary{background:#e6edeb;color:#244c45}a{color:#1b6258}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #cf8038;outline-offset:3px}
+    #status{min-height:24px;margin-top:18px;white-space:pre-wrap}progress{display:block;width:100%;margin-top:18px;accent-color:#1b6258}.hint{font-size:14px}
+    @media(max-width:600px){main{margin:24px auto;padding:18px}.panel{padding:20px}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="brand">BAPS CHARLOTTE</div>
+  <h1>Digital signage</h1>
+  <p>Publish the video shown on your displays.</p>
+  <section class="panel" aria-label="{% if authenticated %}Publish video{% else %}Sign in{% endif %}">
+  {% if authenticated %}
+    <h2>Upload &amp; publish</h2>
+    <p>A successful upload becomes the current video. Displays pick up the change automatically.</p>
+    <form id="upload-form">
+      <label for="video">MP4 video</label>
+      <input id="video" type="file" accept="video/mp4,.mp4" required aria-describedby="format-hint">
+      <p id="format-hint" class="hint">H.264 video with yuv420p format. Maximum {{ max_upload_mb }} MB. Playback is muted.</p>
+      <button id="publish" type="submit">Publish video</button>
+    </form>
+    <progress id="progress" max="100" value="0" hidden aria-label="Upload progress"></progress>
+    <p id="status" role="status" aria-live="polite"></p>
+    <a class="link secondary" href="/view" target="_blank" rel="noopener">Open display view</a>
+    <button class="secondary" id="logout" type="button">Sign out</button>
+  {% else %}
+    <h2>Sign in</h2>
+    <form id="login-form" action="/admin/login" method="post">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button id="sign-in" type="submit">Sign in</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+  {% endif %}
+  </section>
+</main>
+<script>
+const csrf = {{ csrf | tojson }};
+const status = document.getElementById('status');
+{% if authenticated %}
+const publish = document.getElementById('publish');
+const progress = document.getElementById('progress');
+document.getElementById('upload-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const file = document.getElementById('video').files[0];
+  if (!file) return;
+  if (file.size > {{ max_upload_mb }} * 1024 * 1024) {status.textContent = 'Video exceeds the upload limit.'; return;}
+  publish.disabled = true; progress.hidden = false; progress.value = 0;
+  status.textContent = 'Uploading video…';
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/admin/upload');
+  xhr.setRequestHeader('Content-Type', 'video/mp4');
+  xhr.setRequestHeader('X-CSRF-Token', csrf);
+  xhr.upload.onprogress = event => {
+    if (event.lengthComputable) progress.value = 100 * event.loaded / event.total;
+    if (progress.value >= 100) status.textContent = 'Checking the video and publishing…';
+  };
+  xhr.onload = () => {
+    publish.disabled = false;
+    let result = {}; try {result = JSON.parse(xhr.responseText);} catch (_) {}
+    status.textContent = xhr.status >= 200 && xhr.status < 300
+      ? 'Published. Displays will update shortly.'
+      : (result.detail || 'Upload failed. The previously published video is preserved.');
+  };
+  xhr.onerror = () => {publish.disabled = false; status.textContent = 'Connection lost. Check the display before retrying.';};
+  xhr.send(file);
+});
+document.getElementById('logout').addEventListener('click', async () => {
+  try {
+    const response = await fetch('/admin/logout', {method:'POST', headers:{'X-CSRF-Token':csrf}});
+    if (response.ok) location.assign('/admin'); else status.textContent = 'Refresh the page and try signing out again.';
+  } catch (_) {status.textContent = 'Connection lost. Try signing out again.';}
+});
+{% else %}
+document.getElementById('login-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = document.getElementById('sign-in'); button.disabled = true;
+  try {
+    const response = await fetch('/admin/login', {method:'POST', body:new URLSearchParams(new FormData(event.target))});
+    if (response.ok) {location.assign('/admin'); return;}
+    const result = await response.json(); status.textContent = result.detail || 'Sign-in failed.';
+  } catch (_) {status.textContent = 'Connection lost. Please try again.';}
+  button.disabled = false;
+});
+{% endif %}
+</script>
+</body>
+</html>

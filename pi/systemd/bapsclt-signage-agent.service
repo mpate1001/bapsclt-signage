@@ -1,0 +1,20 @@
+[Unit]
+Description=BAPS Charlotte offline signage cache and local player
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/bapsclt-signage/pi
+EnvironmentFile=/etc/bapsclt-signage/pi.env
+ExecStart=/usr/bin/python3 /home/admin/bapsclt-signage/pi/signage-agent.py
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/admin/bapsclt-signage-data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BAPS CLT · Display</title>
+  <style>
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000}
+    video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:black}
+    #waiting{position:fixed;inset:0;display:grid;place-items:center;font:18px system-ui,sans-serif;color:#b5b5b5}
+    #resume{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:5;padding:14px 24px;background:#fff;color:#111;border:0;border-radius:6px;font:16px system-ui,sans-serif}
+  </style>
+</head>
+<body>
+  <div id="waiting" role="status">Waiting for a published video</div>
+  <button id="resume" hidden>Start playback</button>
+<script>
+let currentVersion = null;
+let active = null;
+let busy = false;
+let pendingPlay = null;
+const waiting = document.getElementById('waiting');
+const resume = document.getElementById('resume');
+resume.addEventListener('click', () => {if (pendingPlay) pendingPlay();});
+
+async function replaceVideo(item) {
+  const next = document.createElement('video');
+  next.muted = true; next.autoplay = true; next.loop = true; next.playsInline = true;
+  next.preload = 'auto'; next.style.opacity = '0';
+  document.body.appendChild(next);
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error('Video loading timed out')), 120000);
+      const finish = error => {
+        clearTimeout(timer); next.removeEventListener('canplay', loaded); next.removeEventListener('error', failed);
+        error ? reject(error) : resolve();
+      };
+      const loaded = () => finish();
+      const failed = () => finish(new Error('Video could not load'));
+      next.addEventListener('canplay', loaded); next.addEventListener('error', failed);
+      next.src = item.video_url; next.load();
+    });
+    try {await next.play();}
+    catch (error) {
+      if (error.name !== 'NotAllowedError') throw error;
+      await new Promise(resolve => {
+        pendingPlay = async () => {try {await next.play(); resolve();} catch (_) {}};
+        resume.hidden = false;
+      });
+    }
+    next.style.opacity = '1';
+    if (active) {active.pause(); active.removeAttribute('src'); active.load(); active.remove();}
+    active = next; currentVersion = item.version; waiting.hidden = true;
+    waiting.style.display = 'none'; resume.hidden = true; pendingPlay = null;
+  } catch (error) {
+    next.removeAttribute('src'); next.load(); next.remove();
+    if (!active) waiting.textContent = 'Waiting for the video to become available';
+  }
+}
+
+async function poll() {
+  if (busy) return;
+  busy = true;
+  try {
+    const response = await fetch('/public/current', {cache:'no-store', signal:AbortSignal.timeout(15000)});
+    if (!response.ok) throw new Error('Server unavailable');
+    const item = await response.json();
+    if (item.version && item.version !== currentVersion) await replaceVideo(item);
+  } catch (_) { /* Keep playing the current video while the connection recovers. */ }
+  finally {busy = false;}
+}
+poll(); setInterval(poll, 15000);
+</script>
+</body>
+</html>
