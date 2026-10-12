@@ -28,7 +28,7 @@ class SameOriginRedirect(HTTPRedirectHandler):
         return super().redirect_request(request, fp, code, message, headers, new_url)
 
 class Cache:
-    def __init__(self, directory, base_url, token, max_bytes=2_000_000_000):
+    def __init__(self, directory, base_url, token, max_bytes=2_147_483_648):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.base_url = base_url.rstrip('/')
@@ -336,7 +336,7 @@ def main():
     if interval < 1:
         raise SystemExit('SIGNAGE_POLL_SECONDS must be at least 1')
     cache = Cache(os.environ.get('SIGNAGE_DATA_DIR', '/home/admin/bapsclt-signage-data'), base_url, token,
-                  int(os.environ.get('SIGNAGE_MAX_VIDEO_BYTES', '2000000000')))
+                  int(os.environ.get('SIGNAGE_MAX_VIDEO_BYTES', '2147483648')))
     controls = RemoteControls(cache, os.environ.get('SIGNAGE_DEVICE_ID') or socket.gethostname())
     server = ThreadingHTTPServer(('127.0.0.1', 8090), handler_for(cache, Path(__file__).with_name('index.html')))
     server.daemon_threads = True

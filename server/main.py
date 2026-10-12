@@ -36,7 +36,7 @@ class Settings:
     session_secret: str
     api_token: str
     data_dir: Path
-    max_upload_mb: int = 1024
+    max_upload_mb: int = 2048
     cookie_secure: bool = True
     publisher_username: str = ""
     publisher_password: str = ""
@@ -57,7 +57,7 @@ class Settings:
             raise RuntimeError("Required configuration missing: " + ", ".join(missing))
         if len(values["SESSION_SECRET"]) < 32 or len(values["SIGNAGE_API_TOKEN"]) < 32:
             raise RuntimeError("SESSION_SECRET and SIGNAGE_API_TOKEN must each have at least 32 characters")
-        limit = int(os.environ.get("MAX_UPLOAD_MB", "1024"))
+        limit = int(os.environ.get("MAX_UPLOAD_MB", "2048"))
         if limit < 1:
             raise RuntimeError("MAX_UPLOAD_MB must be positive")
         secure = os.environ.get("COOKIE_SECURE", "true").lower()
@@ -158,11 +158,18 @@ def create_app(settings=None):
                 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_command
                     ON commands(device_id) WHERE status='pending';
             """)
+        initialize_chunks()
+        cleanup_task = asyncio.create_task(cleanup_loop())
         app.state.started_at = time.monotonic()
         app.state.restart_task = None
         try:
             yield
         finally:
+            cleanup_task.cancel()
+            pending = list(chunk_jobs.values())
+            for job in pending:
+                job.cancel()
+            await asyncio.gather(cleanup_task, *pending, return_exceptions=True)
             task = app.state.restart_task
             if task and not task.done():
                 task.cancel()
@@ -371,6 +378,342 @@ def create_app(settings=None):
                 if manifest_tmp:
                     manifest_tmp.unlink(missing_ok=True)
 
+    # Durable, bounded scratch uploads. Only generated identifiers become paths.
+    chunks_dir = settings.data_dir / "uploads"
+    chunk_locks = {}
+    chunk_jobs = {}
+    chunk_size = 8 * 1024 * 1024
+    chunk_ttl = 86400
+
+    def chunk_path(identifier, suffix=".part"):
+        path = chunks_dir / (identifier + suffix)
+        if chunks_dir.is_symlink() or path.is_symlink():
+            raise HTTPException(409, "Upload storage is unavailable.")
+        return path
+
+    def chunk_state(row):
+        state = {key: row[key] for key in ("id", "size", "chunk_size", "next_chunk", "received", "status", "error")}
+        if row["status"] == "complete":
+            state.update(version=row["version"], video_url="/public/video?version=" + row["version"])
+        return state
+
+    def chunk_row(identifier, owner=None):
+        if not re.fullmatch(r"[a-f0-9]{32}", identifier):
+            raise HTTPException(404, "Upload not found.")
+        with database() as db:
+            row = db.execute("SELECT * FROM uploads WHERE id=?", (identifier,)).fetchone()
+        if row is None or (owner is not None and (row["role"], row["username"]) != owner):
+            raise HTTPException(404, "Upload not found.")
+        return row
+
+    def chunk_auth(request, mutation=False):
+        check_portal(request)
+        if mutation:
+            check_csrf(request, request.headers.get("x-csrf-token"))
+        return (session_role(request), request.session["username"])
+
+    def restart_guard():
+        if app.state.restart_task is not None:
+            raise HTTPException(409, "Server restart is scheduled. Try again after it restarts.")
+
+    def reconcile_chunk(row):
+        path = chunk_path(row["id"])
+        if not path.is_file() or path.stat().st_size < row["received"]:
+            with database() as db:
+                db.execute("UPDATE uploads SET status='failed', error=? WHERE id=?", ("Upload storage is incomplete. Select the file again.", row["id"]))
+            raise HTTPException(409, "Upload storage is incomplete. Select the file again.")
+        with open(path, "r+b") as stream:
+            stream.truncate(row["received"])
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path
+
+    def cleanup_chunks():
+        if chunks_dir.is_symlink():
+            return
+        cutoff = time.time() - chunk_ttl
+        with database() as db:
+            rows = db.execute("SELECT id FROM uploads WHERE updated<?", (cutoff,)).fetchall()
+            for row in rows:
+                identifier = row["id"]
+                lock = chunk_locks.get(identifier)
+                if identifier in chunk_jobs or (lock and lock.locked()):
+                    continue
+                # Unlinking a symlink itself is safe; never follow its target.
+                for suffix in (".part", ".chunk"):
+                    (chunks_dir / (identifier + suffix)).unlink(missing_ok=True)
+                db.execute("DELETE FROM upload_chunks WHERE upload_id=?", (identifier,))
+                db.execute("DELETE FROM uploads WHERE id=?", (identifier,))
+                chunk_locks.pop(identifier, None)
+        # Crash leftovers have only generated names and are not published media.
+        with database() as db:
+            # Completed/failed records retain useful status, with a fixed history bound.
+            old = db.execute("SELECT id FROM uploads WHERE status IN ('complete','failed') ORDER BY updated DESC LIMIT -1 OFFSET 128").fetchall()
+            for row in old:
+                identifier = row["id"]
+                lock = chunk_locks.get(identifier)
+                if identifier in chunk_jobs or (lock and lock.locked()):
+                    continue
+                for suffix in (".part", ".chunk"):
+                    (chunks_dir / (identifier + suffix)).unlink(missing_ok=True)
+                db.execute("DELETE FROM upload_chunks WHERE upload_id=?", (identifier,))
+                db.execute("DELETE FROM uploads WHERE id=?", (identifier,))
+                chunk_locks.pop(identifier, None)
+        for path in chunks_dir.glob("*.chunk"):
+            if re.fullmatch(r"[a-f0-9]{32}", path.stem) and path.stem not in chunk_jobs:
+                lock = chunk_locks.get(path.stem)
+                if not lock or not lock.locked():
+                    path.unlink(missing_ok=True)
+
+    def initialize_chunks():
+        if chunks_dir.is_symlink():
+            raise RuntimeError("Upload storage must not be a symlink")
+        chunks_dir.mkdir(exist_ok=True)
+        with database() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS uploads (
+                    id TEXT PRIMARY KEY, role TEXT NOT NULL, username TEXT NOT NULL,
+                    filename TEXT NOT NULL, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
+                    next_chunk INTEGER NOT NULL DEFAULT 0, received INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'receiving', error TEXT, version TEXT,
+                    updated REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS upload_chunks (
+                    upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, digest TEXT NOT NULL,
+                    PRIMARY KEY(upload_id, chunk_index));
+            """)
+            rows = db.execute("SELECT * FROM uploads WHERE status IN ('receiving', 'finalizing')").fetchall()
+        for row in rows:
+            if row["status"] == "finalizing" and row["version"]:
+                try:
+                    published = current()["version"] == row["version"]
+                except HTTPException:
+                    published = False
+                if published:
+                    with database() as db:
+                        db.execute("UPDATE uploads SET status='complete', error=NULL WHERE id=?", (row["id"],))
+                    continue
+            try:
+                reconcile_chunk(row)
+                with database() as db:
+                    db.execute("UPDATE uploads SET status='receiving', error=NULL WHERE id=?", (row["id"],))
+            except (OSError, HTTPException):
+                with database() as db:
+                    db.execute("UPDATE uploads SET status='failed', error=? WHERE id=?", ("Interrupted upload. Select the file again.", row["id"]))
+        cleanup_chunks()
+
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            cleanup_chunks()
+
+    async def small_json(request, empty=False):
+        body = bytearray()
+        async for data in request.stream():
+            if len(body) + len(data) > 8192:
+                raise HTTPException(413, "Upload metadata is too large.")
+            body.extend(data)
+        if not body and empty:
+            return {}
+        try:
+            value = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(400, "Invalid upload metadata.")
+        if not isinstance(value, dict):
+            raise HTTPException(400, "Expected an upload object.")
+        return value
+
+    @app.post("/admin/uploads")
+    @app.post("/upload/uploads")
+    async def create_chunk_upload(request: Request):
+        owner = chunk_auth(request, True)
+        restart_guard()
+        item = await small_json(request)
+        restart_guard()
+        size, filename = item.get("size"), item.get("filename", "")
+        if (set(item) - {"size", "filename"} or type(size) is not int or size < 1
+                or not isinstance(filename, str) or len(filename) > 255):
+            raise HTTPException(400, "Invalid upload size or filename.")
+        if size > settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, "Video exceeds the upload limit.")
+        cleanup_chunks()
+        identifier = secrets.token_hex(16)
+        with database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT COUNT(*) FROM uploads WHERE status IN ('receiving','finalizing')").fetchone()[0] >= 8:
+                raise HTTPException(409, "Upload capacity is busy. Try again later.")
+            if db.execute("SELECT COUNT(*) FROM uploads WHERE role=? AND username=? AND status IN ('receiving','finalizing')", owner).fetchone()[0] >= 2:
+                raise HTTPException(409, "Finish or cancel your existing uploads first.")
+            path = chunk_path(identifier)
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            os.close(descriptor)
+            try:
+                db.execute("INSERT INTO uploads(id,role,username,filename,size,chunk_size,updated) VALUES (?,?,?,?,?,?,?)", (identifier, *owner, filename, size, chunk_size, time.time()))
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
+        return JSONResponse(chunk_state(chunk_row(identifier)), status_code=201)
+
+    @app.get("/admin/uploads/{identifier}")
+    @app.get("/upload/uploads/{identifier}")
+    async def upload_state(request: Request, identifier: str):
+        return chunk_state(chunk_row(identifier, chunk_auth(request)))
+
+    @app.post("/admin/uploads/{identifier}/chunks/{index}")
+    @app.post("/upload/uploads/{identifier}/chunks/{index}")
+    async def receive_chunk(request: Request, identifier: str, index: int):
+        owner = chunk_auth(request, True)
+        chunk_row(identifier, owner)
+        restart_guard()
+        async with chunk_locks.setdefault(identifier, asyncio.Lock()):
+            restart_guard()
+            row = chunk_row(identifier, owner)
+            if row["status"] != "receiving":
+                raise HTTPException(409, "Upload is no longer receiving data.")
+            if index < 0 or index > row["next_chunk"] or index * row["chunk_size"] >= row["size"]:
+                raise HTTPException(409, "Unexpected chunk index. Check upload status.")
+            expected = min(row["chunk_size"], row["size"] - index * row["chunk_size"])
+            if request.headers.get("content-type", "").split(";")[0] != "application/octet-stream":
+                raise HTTPException(415, "Expected binary chunk data.")
+            length = request.headers.get("content-length")
+            if length is not None:
+                try:
+                    declared = int(length)
+                except ValueError:
+                    raise HTTPException(400, "Invalid content length.")
+                if declared != expected:
+                    raise HTTPException(413 if declared > expected else 400, "Incorrect chunk length.")
+            path = reconcile_chunk(row)
+            temporary = chunk_path(identifier, ".chunk")
+            digest, size = hashlib.sha256(), 0
+            try:
+                fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as output:
+                    async for data in request.stream():
+                        if size + len(data) > expected:
+                            raise HTTPException(413, "Chunk exceeds its expected size.")
+                        output.write(data)
+                        digest.update(data)
+                        size += len(data)
+                if size != expected:
+                    raise HTTPException(400, "Incomplete chunk. Retry this chunk.")
+                restart_guard()
+                checksum = digest.hexdigest()
+                with database() as db:
+                    prior = db.execute("SELECT digest FROM upload_chunks WHERE upload_id=? AND chunk_index=?", (identifier, index)).fetchone()
+                if index < row["next_chunk"]:
+                    if not prior or not secrets.compare_digest(prior["digest"], checksum):
+                        raise HTTPException(409, "Retried chunk differs from the saved chunk.")
+                    return chunk_state(row)
+                with open(path, "ab") as output, open(temporary, "rb") as source:
+                    while data := source.read(1024 * 1024):
+                        output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                with database() as db:
+                    db.execute("INSERT INTO upload_chunks VALUES (?,?,?)", (identifier, index, checksum))
+                    db.execute("UPDATE uploads SET next_chunk=next_chunk+1, received=received+?, updated=? WHERE id=?", (size, time.time(), identifier))
+                return chunk_state(chunk_row(identifier, owner))
+            except OSError:
+                raise HTTPException(507, "Upload storage is unavailable. Retry after freeing space.")
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def inspect_chunk_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            while data := source.read(1024 * 1024):
+                digest.update(data)
+        validate_video(path)
+        return digest.hexdigest()
+
+    async def finalize_chunk(identifier):
+        try:
+            async with upload_lock:
+                row = chunk_row(identifier)
+                path = reconcile_chunk(row)
+                inspection = asyncio.create_task(asyncio.to_thread(inspect_chunk_file, path))
+                try:
+                    version = await asyncio.shield(inspection)
+                except asyncio.CancelledError:
+                    # The validator thread must finish before shutdown releases scratch state.
+                    try:
+                        await inspection
+                    except Exception:
+                        pass
+                    raise
+                with database() as db:
+                    db.execute("UPDATE uploads SET version=?, updated=? WHERE id=?", (version, time.time(), identifier))
+                destination = media_dir / (version + ".mp4")
+                if destination.is_symlink():
+                    raise HTTPException(409, "Media storage is unavailable.")
+                if not destination.exists():
+                    os.replace(path, destination)
+                descriptor, name = tempfile.mkstemp(prefix=".current-", dir=settings.data_dir)
+                temporary = Path(name)
+                try:
+                    with os.fdopen(descriptor, "w") as output:
+                        json.dump({"version": version, "size": row["size"]}, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary, manifest_path)
+                    with database() as db:
+                        db.execute("UPDATE uploads SET status='complete', error=NULL, updated=? WHERE id=?", (time.time(), identifier))
+                    path.unlink(missing_ok=True)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not chunks_dir.is_symlink():
+                (chunks_dir / (identifier + ".part")).unlink(missing_ok=True)
+            message = exc.detail if isinstance(exc, HTTPException) and isinstance(exc.detail, str) else "Video could not be published. Try again."
+            with database() as db:
+                db.execute("UPDATE uploads SET status='failed', error=?, updated=? WHERE id=?", (message, time.time(), identifier))
+        finally:
+            chunk_jobs.pop(identifier, None)
+
+    @app.post("/admin/uploads/{identifier}/complete")
+    @app.post("/upload/uploads/{identifier}/complete")
+    async def complete_chunk_upload(request: Request, identifier: str):
+        owner = chunk_auth(request, True)
+        chunk_row(identifier, owner)
+        restart_guard()
+        if await small_json(request, empty=True) != {}:
+            raise HTTPException(400, "Expected an empty completion object.")
+        async with chunk_locks.setdefault(identifier, asyncio.Lock()):
+            restart_guard()
+            row = chunk_row(identifier, owner)
+            if row["status"] == "complete":
+                return chunk_state(row)
+            if row["status"] == "finalizing":
+                return JSONResponse(chunk_state(row), status_code=202)
+            if row["status"] != "receiving" or row["received"] != row["size"]:
+                raise HTTPException(409, "Upload is incomplete or failed.")
+            reconcile_chunk(row)
+            with database() as db:
+                db.execute("UPDATE uploads SET status='finalizing', updated=? WHERE id=?", (time.time(), identifier))
+            chunk_jobs[identifier] = asyncio.create_task(finalize_chunk(identifier))
+            return JSONResponse(chunk_state(chunk_row(identifier, owner)), status_code=202)
+
+    @app.delete("/admin/uploads/{identifier}")
+    @app.delete("/upload/uploads/{identifier}")
+    async def cancel_chunk_upload(request: Request, identifier: str):
+        owner = chunk_auth(request, True)
+        chunk_row(identifier, owner)
+        async with chunk_locks.setdefault(identifier, asyncio.Lock()):
+            row = chunk_row(identifier, owner)
+            if row["status"] not in ("receiving", "failed"):
+                raise HTTPException(409, "Publishing or published uploads cannot be cancelled.")
+            if chunks_dir.is_symlink():
+                raise HTTPException(409, "Upload storage is unavailable.")
+            for suffix in (".part", ".chunk"):
+                (chunks_dir / (identifier + suffix)).unlink(missing_ok=True)
+            with database() as db:
+                db.execute("DELETE FROM upload_chunks WHERE upload_id=?", (identifier,))
+                db.execute("DELETE FROM uploads WHERE id=?", (identifier,))
+        chunk_locks.pop(identifier, None)
+        return {"ok": True}
+
     def check_admin(request, mutation=False):
         check_portal(request)
         if session_role(request) != "admin":
@@ -501,7 +844,7 @@ def create_app(settings=None):
         check_admin(request, mutation=True)
         if not settings.allow_restart:
             raise HTTPException(403, "Server restart is disabled.")
-        if upload_lock.locked():
+        if upload_lock.locked() or chunk_jobs:
             raise HTTPException(409, "An upload is publishing. Try again shortly.")
         if app.state.restart_task is not None:
             raise HTTPException(409, "Server restart is already scheduled.")

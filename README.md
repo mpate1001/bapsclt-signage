@@ -46,7 +46,7 @@ Use a long unique password, and generate a separate random value for each secret
 python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-`ADMIN_USERNAME` defaults to `admin`. `MAX_UPLOAD_MB` defaults to 1024 MiB.
+`ADMIN_USERNAME` defaults to `admin`. `MAX_UPLOAD_MB` defaults to 2048 MiB (2 GiB).
 Keep `COOKIE_SECURE=true` when using HTTPS. For testing at localhost over HTTP,
 set it to `false`, then restore `true` before public use.
 
@@ -79,6 +79,36 @@ One upload replaces the currently published video; there is no playlist editor.
 Docker stores media in a named volume that survives container rebuilds. Back up
 that volume. Do not use `docker compose down -v` unless you intend to erase it.
 Keep one server process/replica, as configured, to serialize publication.
+
+## Larger videos through Cloudflare Free
+
+The upload portal sends one selected video in 8 MiB chunks, then asks the server
+to validate and publish the assembled file. Each request stays below Cloudflare
+Free's 100 MB request limit. You do not need to split the video yourself. Both the
+administrator and shared publisher use this flow.
+
+The default total limit is **2048 MiB (2 GiB / 2147483648 bytes)**. For the existing
+TrueNAS Apps deployment, set `MAX_UPLOAD_MB: '2048'` under the service environment.
+On the Pi, set `SIGNAGE_MAX_VIDEO_BYTES=2147483648` in
+`/etc/bapsclt-signage/pi.env`, then restart the agent. Existing environment values
+override new code defaults, so both settings must be updated during deployment.
+
+Progress first reports transfer, then video validation/publication. The portal
+retries temporary connection failures while the page remains open; confirmed
+chunks are retained rather than uploaded again. Final validation runs in the
+background and is checked through short status requests, so a large video does
+not require one long request through Cloudflare. Keep the page open until it
+reports publication complete. Cancelling during transfer removes the temporary
+upload; the currently published video stays available until a replacement passes
+validation and is published.
+
+Unfinished upload sessions expire after 24 hours and temporary data is cleaned up.
+The server needs enough free storage for the assembled video alongside retained
+videos. The legacy single-request upload API remains available for compatibility,
+but large files through Cloudflare should use the portal's chunked flow.
+
+Cloudflare's plan limits are documented in
+[Error 413](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/).
 
 ## Admin management
 

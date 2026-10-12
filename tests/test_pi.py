@@ -280,3 +280,36 @@ def test_helper_capability_is_bounded_and_units_are_narrow(tmp_path):
     assert 'ExecStart=/usr/bin/systemctl reboot' in unit
     assert 'User=root' in unit
     assert 'NoNewPrivileges=true' in (root / 'bapsclt-signage-agent.service').read_text()
+
+
+def test_default_limit_is_two_gib_without_allocating_video(tmp_path):
+    cache = agent.Cache(tmp_path, 'https://example.com', 'secret')
+    assert cache.max_bytes == 2_147_483_648
+    description = metadata(b'video') | {'size': 2_147_483_648}
+    with patch.object(cache, '_open', side_effect=[io.BytesIO(json.dumps(description).encode()), OSError('simulated outage')]) as opened:
+        with pytest.raises(OSError):
+            cache.update()
+        assert opened.call_count == 2  # The exact upper boundary passes metadata validation.
+    assert cache.state() == {'version': None}
+    assert not list(tmp_path.glob('.download-*'))
+    description['size'] += 1
+    with patch.object(cache, '_open', return_value=io.BytesIO(json.dumps(description).encode())) as opened:
+        with pytest.raises(ValueError):
+            cache.update()
+        assert opened.call_count == 1  # Above the cap is refused before download.
+
+
+@pytest.mark.parametrize('configured, expected', [(None, 2_147_483_648), ('2000000000', 2_000_000_000)])
+def test_startup_default_and_existing_explicit_limit(monkeypatch, configured, expected):
+    monkeypatch.setenv('SIGNAGE_API_TOKEN', 'fake-test-token')
+    monkeypatch.setenv('SIGNAGE_URL', 'https://example.com')
+    monkeypatch.setenv('SIGNAGE_POLL_SECONDS', '30')
+    if configured is None:
+        monkeypatch.delenv('SIGNAGE_MAX_VIDEO_BYTES', raising=False)
+    else:
+        monkeypatch.setenv('SIGNAGE_MAX_VIDEO_BYTES', configured)
+    # Stop before HTTP server, heartbeat, or reboot support starts.
+    with patch.object(agent, 'Cache', side_effect=RuntimeError('captured config')) as constructor:
+        with pytest.raises(RuntimeError, match='captured config'):
+            agent.main()
+        assert constructor.call_args.args[3] == expected

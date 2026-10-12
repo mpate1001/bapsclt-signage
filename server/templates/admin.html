@@ -36,6 +36,7 @@
       <input id="video" type="file" accept="video/mp4,.mp4" required aria-describedby="format-hint">
       <p id="format-hint" class="hint">H.264 video with yuv420p format. Maximum {{ max_upload_mb }} MB. Playback is muted.</p>
       <button id="publish" type="submit">Publish video</button>
+      <button id="cancel-upload" class="secondary" type="button" hidden>Cancel upload</button>
     </form>
     <progress id="progress" max="100" value="0" hidden aria-label="Upload progress"></progress>
     <p id="status" role="status" aria-live="polite"></p>
@@ -84,37 +85,153 @@ const status = document.getElementById('status');
 {% if authenticated %}
 const publish = document.getElementById('publish');
 const progress = document.getElementById('progress');
-document.getElementById('upload-form').addEventListener('submit', event => {
+const cancelUpload = document.getElementById('cancel-upload');
+const videoInput = document.getElementById('video');
+const uploadPrefix = {{ portal_path | tojson }} + '/uploads';
+let uploading = false;
+let uploadCanceled = false;
+let activeChunk = null;
+const uploadDelay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const transientUploadError = error => !error.code || [408, 429, 500, 502, 503, 504].includes(error.code);
+function uploadError(message, code) {const error = new Error(message); error.code = code; return error;}
+function checkCanceled() {if (uploadCanceled) throw uploadError('Upload canceled.', 'canceled');}
+async function uploadRequest(path, method = 'GET', body) {
+  const response = await fetch(path, {
+    method, cache:'no-store', signal:AbortSignal.timeout(20000),
+    headers:method === 'GET' ? {} : {'X-CSRF-Token':csrf, 'Content-Type':'application/json'},
+    ...(body === undefined ? {} : {body:JSON.stringify(body)})
+  });
+  let result = {}; try {result = await response.json();} catch (_) {}
+  if (!response.ok) throw uploadError(
+    [401, 403].includes(response.status) ? 'Your session expired. Refresh and sign in again.'
+      : typeof result.detail === 'string' ? result.detail : 'The server could not accept this request.', response.status);
+  return result;
+}
+function sendChunk(path, blob, received, size) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(); activeChunk = xhr;
+    xhr.open('POST', path); xhr.timeout = 90000;
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-CSRF-Token', csrf);
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) progress.value = Math.min(100, 100 * (received + event.loaded) / size);
+    };
+    const finish = callback => {if (activeChunk === xhr) activeChunk = null; callback();};
+    xhr.onload = () => finish(() => {
+      let result = {}; try {result = JSON.parse(xhr.responseText);} catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(result);
+      else reject(uploadError([401, 403].includes(xhr.status) ? 'Your session expired. Refresh and sign in again.'
+        : typeof result.detail === 'string' ? result.detail : 'The server could not accept this part of the video.', xhr.status));
+    });
+    xhr.onerror = xhr.ontimeout = () => finish(() => reject(uploadError('Connection interrupted.')));
+    xhr.onabort = () => finish(() => reject(uploadError('Upload canceled.', 'canceled')));
+    xhr.send(blob);
+  });
+}
+async function readUpload(path) {
+  for (let attempt = 0; ; attempt++) {
+    checkCanceled();
+    try {return await uploadRequest(path);} catch (error) {
+      if (!transientUploadError(error) || attempt >= 5) throw error;
+      status.textContent = 'Connection interrupted. Reconnecting…';
+      await uploadDelay(Math.min(1000 * 2 ** attempt, 10000));
+    }
+  }
+}
+function checkUploadState(state, file) {
+  if (state.status === 'failed') throw uploadError(state.error || 'The video could not be published.', 'failed');
+  if (state.size !== file.size || !Number.isInteger(state.received) || state.received < 0 || state.received > file.size
+      || !Number.isInteger(state.chunk_size) || state.chunk_size < 1 || state.chunk_size > 8 * 1024 * 1024
+      || !Number.isInteger(state.next_chunk) || state.next_chunk !== Math.ceil(state.received / state.chunk_size)
+      || (state.received !== file.size && state.received % state.chunk_size !== 0)
+      || !['receiving', 'finalizing', 'complete'].includes(state.status)) {
+    throw uploadError('Upload status could not be verified. Refresh the page before trying again.', 'invalid');
+  }
+}
+cancelUpload.addEventListener('click', () => {
+  uploadCanceled = true; cancelUpload.disabled = true;
+  status.textContent = 'Canceling upload…';
+  if (activeChunk) activeChunk.abort();
+});
+document.getElementById('upload-form').addEventListener('submit', async event => {
   event.preventDefault();
-  const file = document.getElementById('video').files[0];
+  if (uploading || publish.disabled) return;
+  const file = videoInput.files[0];
   if (!file) return;
   if (file.size > {{ max_upload_mb }} * 1024 * 1024) {status.textContent = 'Video exceeds the upload limit.'; return;}
-  publish.disabled = true; progress.hidden = false; progress.value = 0;
+  if (!file.size) {status.textContent = 'Choose a video that is not empty.'; return;}
+  uploading = true; uploadCanceled = false;
+  publish.disabled = true; videoInput.disabled = true;
+  cancelUpload.hidden = false; cancelUpload.disabled = false;
+  progress.hidden = false; progress.value = 0;
   {% if admin_controls %}restartButton.disabled = true;{% endif %}
-  status.textContent = 'Uploading video…';
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '{{ portal_path }}/upload');
-  xhr.setRequestHeader('Content-Type', 'video/mp4');
-  xhr.setRequestHeader('X-CSRF-Token', csrf);
-  xhr.upload.onprogress = event => {
-    if (event.lengthComputable) progress.value = 100 * event.loaded / event.total;
-    if (progress.value >= 100) status.textContent = 'Checking the video and publishing…';
-  };
-  xhr.onload = () => {
-    publish.disabled = false;
+  status.textContent = 'Preparing upload…';
+  let uploadPath = null;
+  try {
+    // Creation is not automatically retried: a lost reply may already have created an upload.
+    let state = await uploadRequest(uploadPrefix, 'POST', {filename:file.name, size:file.size});
+    if (!/^[a-f0-9]{32}$/.test(state.id)) throw uploadError('Upload could not be started.', 'invalid');
+    uploadPath = uploadPrefix + '/' + state.id;
+    checkCanceled(); checkUploadState(state, file);
+    let attempts = 0;
+    let retryStarted = 0;
+    while (state.status === 'receiving' && state.received < file.size) {
+      checkCanceled();
+      const received = state.received;
+      status.textContent = 'Uploading video… ' + Math.floor(100 * received / file.size) + '%';
+      progress.value = 100 * received / file.size;
+      try {
+        state = await sendChunk(uploadPath + '/chunks/' + state.next_chunk,
+          file.slice(received, Math.min(received + state.chunk_size, file.size)), received, file.size);
+        checkUploadState(state, file); attempts = 0; retryStarted = 0;
+      } catch (error) {
+        checkCanceled();
+        if ((!transientUploadError(error) && error.code !== 409) || attempts >= 7
+            || (retryStarted && Date.now() - retryStarted > 90000)) throw error;
+        if (!retryStarted) retryStarted = Date.now();
+        status.textContent = 'Connection interrupted. Checking upload progress…';
+        await uploadDelay(Math.min(1000 * 2 ** attempts++, 10000));
+        state = await readUpload(uploadPath); checkUploadState(state, file);
+        if (state.received > received) {attempts = 0; retryStarted = 0;}
+      }
+    }
+    checkCanceled();
+    // Publishing runs on the server; cancel is unavailable once it may have started.
+    cancelUpload.disabled = true; progress.value = 100;
+    status.textContent = 'Upload finished. Checking the video and publishing…';
+    const deadline = Date.now() + 10 * 60 * 1000;
+    let finalizeAttempts = 0;
+    while (state.status !== 'complete') {
+      if (Date.now() > deadline) throw uploadError('Publishing is taking longer than expected. Check the display and video library before retrying.', 'unknown');
+      if (state.status === 'receiving') {
+        if (++finalizeAttempts > 8) throw uploadError('Publishing could not be confirmed. Check the display and video library before retrying.', 'unknown');
+        try {state = await uploadRequest(uploadPath + '/complete', 'POST', {});}
+        catch (error) {
+          if (!transientUploadError(error) && error.code !== 409) throw error;
+          await uploadDelay(Math.min(1000 * 2 ** (finalizeAttempts - 1), 10000));
+          state = await readUpload(uploadPath);
+        }
+      } else {
+        await uploadDelay(2000); state = await readUpload(uploadPath);
+      }
+      checkUploadState(state, file);
+    }
+    status.textContent = 'Published. Displays will update shortly.';
+    videoInput.value = '';
+    {% if admin_controls %}await refreshControls();{% endif %}
+  } catch (error) {
+    if (uploadCanceled && uploadPath) {
+      try {
+        await uploadRequest(uploadPath, 'DELETE');
+        status.textContent = 'Upload canceled.';
+      } catch (_) {status.textContent = 'Cancellation could not be confirmed. Refresh the page and check the video library.';}
+    } else if (uploadCanceled) {status.textContent = 'Upload canceled. Any temporary upload will expire automatically.';}
+    else status.textContent = transientUploadError(error)
+      ? 'Connection lost. Check the display and video library before retrying.' : error.message;
+  } finally {
+    uploading = false; publish.disabled = false; videoInput.disabled = false; cancelUpload.hidden = true;
     {% if admin_controls %}restartButton.disabled = actionBusy || !restartAllowed;{% endif %}
-    let result = {}; try {result = JSON.parse(xhr.responseText);} catch (_) {}
-    status.textContent = xhr.status >= 200 && xhr.status < 300
-      ? 'Published. Displays will update shortly.'
-      : (result.detail || 'Upload failed. The previously published video is preserved.');
-    {% if admin_controls %}if (xhr.status >= 200 && xhr.status < 300) refreshControls();{% endif %}
-  };
-  xhr.onerror = () => {
-    publish.disabled = false;
-    {% if admin_controls %}restartButton.disabled = actionBusy || !restartAllowed;{% endif %}
-    status.textContent = 'Connection lost. Check the display before retrying.';
-  };
-  xhr.send(file);
+  }
 });
 document.getElementById('logout').addEventListener('click', async () => {
   try {
