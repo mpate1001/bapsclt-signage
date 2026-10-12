@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BAPS CLT · Signage admin</title>
+  <title>BAPS CLT · {{ portal_title }}</title>
   <style>
     :root{color-scheme:light;font-family:system-ui,sans-serif;color:#172a31;background:#edf1f0}
     *{box-sizing:border-box}[hidden]{display:none!important}body{margin:0}main{max-width:680px;margin:8vh auto;padding:24px}
@@ -18,7 +18,7 @@
 <body>
 <main>
   <div class="brand">BAPS CHARLOTTE</div>
-  <h1>Digital signage</h1>
+  <h1>{{ portal_title }}</h1>
   <p>Publish the video shown on your displays.</p>
   <section class="panel" aria-label="{% if authenticated %}Publish video{% else %}Sign in{% endif %}">
   {% if authenticated %}
@@ -36,7 +36,7 @@
     <button class="secondary" id="logout" type="button">Sign out</button>
   {% else %}
     <h2>Sign in</h2>
-    <form id="login-form" action="/admin/login" method="post">
+    <form id="login-form" action="{{ portal_path }}/login" method="post">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <label for="username">Username</label>
       <input id="username" name="username" autocomplete="username" required>
@@ -62,7 +62,7 @@ document.getElementById('upload-form').addEventListener('submit', event => {
   publish.disabled = true; progress.hidden = false; progress.value = 0;
   status.textContent = 'Uploading video…';
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/admin/upload');
+  xhr.open('POST', '{{ portal_path }}/upload');
   xhr.setRequestHeader('Content-Type', 'video/mp4');
   xhr.setRequestHeader('X-CSRF-Token', csrf);
   xhr.upload.onprogress = event => {
@@ -81,8 +81,8 @@ document.getElementById('upload-form').addEventListener('submit', event => {
 });
 document.getElementById('logout').addEventListener('click', async () => {
   try {
-    const response = await fetch('/admin/logout', {method:'POST', headers:{'X-CSRF-Token':csrf}});
-    if (response.ok) location.assign('/admin'); else status.textContent = 'Refresh the page and try signing out again.';
+    const response = await fetch('{{ portal_path }}/logout', {method:'POST', headers:{'X-CSRF-Token':csrf}});
+    if (response.ok) location.assign({{ portal_path | tojson }}); else status.textContent = 'Refresh the page and try signing out again.';
   } catch (_) {status.textContent = 'Connection lost. Try signing out again.';}
 });
 {% else %}
@@ -90,8 +90,8 @@ document.getElementById('login-form').addEventListener('submit', async event => 
   event.preventDefault();
   const button = document.getElementById('sign-in'); button.disabled = true;
   try {
-    const response = await fetch('/admin/login', {method:'POST', body:new URLSearchParams(new FormData(event.target))});
-    if (response.ok) {location.assign('/admin'); return;}
+    const response = await fetch('{{ portal_path }}/login', {method:'POST', body:new URLSearchParams(new FormData(event.target))});
+    if (response.ok) {location.assign({{ portal_path | tojson }}); return;}
     const result = await response.json(); status.textContent = result.detail || 'Sign-in failed.';
   } catch (_) {status.textContent = 'Connection lost. Please try again.';}
   button.disabled = false;

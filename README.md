@@ -62,7 +62,8 @@ Configure the proxy's upload size and timeout to accommodate your videos.
 
 The public hostname is configured in your reverse proxy / tunnel, not in Python:
 
-- `https://bapsclt.datavault.digital/admin`: sign in and upload.
+- `https://bapsclt.datavault.digital/admin`: administrator sign-in and upload.
+- `https://bapsclt.datavault.digital/upload`: publisher sign-in and upload.
 - `https://bapsclt.datavault.digital/view`: media-only viewer.
 - `/`: redirects to `/view`.
 - `/health`: container health check.
@@ -78,6 +79,33 @@ One upload replaces the currently published video; there is no playlist editor.
 Docker stores media in a named volume that survives container rebuilds. Back up
 that volume. Do not use `docker compose down -v` unless you intend to erase it.
 Keep one server process/replica, as configured, to serialize publication.
+
+## Shared publisher account
+
+Enable an optional publisher account with `PUBLISHER_USERNAME` and
+`PUBLISHER_PASSWORD` in the server environment. Set both values or leave both
+blank to disable the account. Its username must differ from `ADMIN_USERNAME`.
+Keep the password outside the repository.
+
+For the shared account, set the username to `bapsclt` and choose its password in
+your private server configuration. Share the `/upload` URL with publishers. This
+account can upload and publish videos through `/upload`, but cannot access the
+`/admin` portal or its protected endpoints. The administrator retains access to
+both portals. The `/view` page remains public.
+
+When using the TrueNAS Apps YAML installation, add these keys under the existing
+service `environment` section after deploying an image built from the updated
+repository:
+
+```yaml
+PUBLISHER_USERNAME: 'bapsclt'
+PUBLISHER_PASSWORD: '<set privately in TrueNAS>'
+```
+
+Rebuild the server image and restart the app to apply code or credential changes.
+After updating to role-based sessions, sign in again. Disabling the publisher
+account or changing its username invalidates its existing access. Sign-in sessions
+otherwise expire after eight hours.
 
 ## Raspberry Pi installation
 

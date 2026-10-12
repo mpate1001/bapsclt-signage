@@ -30,6 +30,14 @@ class Settings:
     data_dir: Path
     max_upload_mb: int = 1024
     cookie_secure: bool = True
+    publisher_username: str = ""
+    publisher_password: str = ""
+
+    def __post_init__(self):
+        if bool(self.publisher_username.strip()) != bool(self.publisher_password.strip()):
+            raise RuntimeError("PUBLISHER_USERNAME and PUBLISHER_PASSWORD must both be set or both be blank")
+        if self.publisher_username and self.publisher_username == self.username:
+            raise RuntimeError("PUBLISHER_USERNAME must differ from ADMIN_USERNAME")
 
     @classmethod
     def from_env(cls):
@@ -48,7 +56,8 @@ class Settings:
             raise RuntimeError("COOKIE_SECURE must be true or false")
         return cls(values["ADMIN_USERNAME"], values["ADMIN_PASSWORD"], values["SESSION_SECRET"],
                    values["SIGNAGE_API_TOKEN"], Path(os.environ.get("DATA_DIR", "./data")),
-                   limit, secure == "true")
+                   limit, secure == "true", os.environ.get("PUBLISHER_USERNAME", ""),
+                   os.environ.get("PUBLISHER_PASSWORD", ""))
 
 
 def validate_video(path: Path):
@@ -112,11 +121,23 @@ def create_app(settings=None):
     def check_csrf(request, value):
         expected = request.session.get("csrf", "")
         if not expected or not isinstance(value, str) or not secrets.compare_digest(expected.encode(), value.encode()):
-            raise HTTPException(403, "Session expired. Refresh the admin page and try again.")
+            raise HTTPException(403, "Session expired. Refresh the sign-in page and try again.")
 
-    def check_admin(request):
-        if not request.session.get("authenticated"):
+    def session_role(request):
+        role, username = request.session.get("role"), request.session.get("username")
+        if role == "admin" and username == settings.username:
+            return role
+        if (role == "publisher" and settings.publisher_username.strip()
+                and settings.publisher_password.strip() and username == settings.publisher_username):
+            return role
+        return None
+
+    def check_portal(request):
+        role = session_role(request)
+        if role is None:
             raise HTTPException(401, "Sign in to upload.")
+        if request.url.path.startswith("/admin") and role != "admin":
+            raise HTTPException(403, "This account can only use the upload portal.")
 
     def check_token(request):
         value = request.headers.get("authorization", "")
@@ -167,13 +188,20 @@ def create_app(settings=None):
         return templates.TemplateResponse(request=request, name="view.html", context={})
 
     @app.get("/admin")
+    @app.get("/upload")
     async def admin(request: Request):
+        portal_path = "/admin" if request.url.path == "/admin" else "/upload"
+        role = session_role(request)
+        if portal_path == "/admin" and role == "publisher":
+            raise HTTPException(403, "This account can only use the upload portal.")
         return templates.TemplateResponse(request=request, name="admin.html", context={
-            "authenticated": bool(request.session.get("authenticated")), "csrf": csrf(request),
-            "max_upload_mb": settings.max_upload_mb,
+            "authenticated": role is not None, "csrf": csrf(request),
+            "max_upload_mb": settings.max_upload_mb, "portal_path": portal_path,
+            "portal_title": "Signage admin" if portal_path == "/admin" else "Upload portal",
         })
 
     @app.post("/admin/login")
+    @app.post("/upload/login")
     async def login(request: Request):
         body = bytearray()
         async for chunk in request.stream():
@@ -190,23 +218,32 @@ def create_app(settings=None):
         password = values.get("password", [""])[0]
         username_ok = secrets.compare_digest(username.encode(), settings.username.encode())
         password_ok = secrets.compare_digest(password.encode(), settings.password.encode())
-        if not (username_ok and password_ok):
+        role = "admin" if username_ok and password_ok else None
+        portal_path = "/admin" if request.url.path == "/admin/login" else "/upload"
+        if portal_path == "/upload" and settings.publisher_username.strip() and settings.publisher_password.strip():
+            publisher_username_ok = secrets.compare_digest(username.encode(), settings.publisher_username.encode())
+            publisher_password_ok = secrets.compare_digest(password.encode(), settings.publisher_password.encode())
+            if publisher_username_ok and publisher_password_ok:
+                role = "publisher"
+        if role is None:
             login_failures.append(now)
             raise HTTPException(401, "Incorrect username or password.")
         request.session.clear()
-        request.session.update(authenticated=True, csrf=secrets.token_urlsafe(32))
-        return RedirectResponse("/admin", status_code=303)
+        request.session.update(role=role, username=username, csrf=secrets.token_urlsafe(32))
+        return RedirectResponse(portal_path, status_code=303)
 
     @app.post("/admin/logout")
+    @app.post("/upload/logout")
     async def logout(request: Request):
-        check_admin(request)
+        check_portal(request)
         check_csrf(request, request.headers.get("x-csrf-token"))
         request.session.clear()
         return JSONResponse({"ok": True})
 
     @app.post("/admin/upload")
+    @app.post("/upload/upload")
     async def upload(request: Request):
-        check_admin(request)
+        check_portal(request)
         check_csrf(request, request.headers.get("x-csrf-token"))
         if request.headers.get("content-type", "").split(";")[0] not in ("video/mp4", "application/octet-stream"):
             raise HTTPException(415, "Select an MP4 file.")

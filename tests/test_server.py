@@ -200,3 +200,119 @@ def test_real_h264_video_roundtrip(client, tmp_path):
     # Actual ffprobe must reject plain text masquerading as MP4 and keep publication intact.
     assert publish(client, token, b"not actually an mp4").status_code == 400
     assert client.get("/public/current").json() == metadata
+
+
+@pytest.fixture
+def publisher_client(tmp_path):
+    settings = server.Settings("admin", "secret-password", "s" * 40, "t" * 40,
+                               tmp_path, 1, False, "publisher", "fake-publisher-password")
+    with TestClient(server.create_app(settings)) as value:
+        value.data_dir = tmp_path
+        yield value
+
+
+def portal_csrf(client, portal="/upload"):
+    page = client.get(portal)
+    assert page.status_code == 200
+    return re.search(r'const csrf = "([^\"]+)";', page.text).group(1)
+
+
+def publisher_sign_in(client):
+    token = portal_csrf(client)
+    response = client.post("/upload/login", data={"username": "publisher",
+                           "password": "fake-publisher-password", "csrf": token})
+    assert response.status_code == 200
+    assert "Upload portal" in response.text
+    assert "/admin/" not in response.text
+    return portal_csrf(client)
+
+
+def test_publisher_login_upload_and_admin_denial(publisher_client):
+    client = publisher_client
+    token = publisher_sign_in(client)
+    assert client.get("/admin").status_code == 403
+    for route in ("/admin/upload", "/admin/logout"):
+        assert client.post(route, content=b"video", headers={"Content-Type": "video/mp4",
+                           "X-CSRF-Token": token}).status_code == 403
+    # Portal sessions never grant access to device API endpoints or expose their secret.
+    assert client.get("/api/current").status_code == 401
+    assert client.get("/api/video").status_code == 401
+    assert "t" * 40 not in client.get("/upload").text
+    with patch.object(server, "validate_video"):
+        response = client.post("/upload/upload", content=b"published video",
+                               headers={"Content-Type": "video/mp4", "X-CSRF-Token": token})
+    assert response.status_code == 200
+    assert client.get(response.json()["video_url"]).content == b"published video"
+    assert client.post("/admin/login", data={"username": "publisher",
+                       "password": "fake-publisher-password", "csrf": token}).status_code == 401
+
+
+def test_publisher_csrf_and_logout(publisher_client):
+    client = publisher_client
+    old_token = portal_csrf(client)
+    assert client.post("/upload/login", data={"username": "publisher",
+                       "password": "fake-publisher-password"}).status_code == 403
+    token = publisher_sign_in(client)
+    assert token != old_token
+    assert client.post("/upload/upload", content=b"video", headers={"Content-Type": "video/mp4",
+                       "X-CSRF-Token": old_token}).status_code == 403
+    assert client.post("/upload/logout", headers={"X-CSRF-Token": "wrong"}).status_code == 403
+    assert client.post("/upload/logout", headers={"X-CSRF-Token": token}).status_code == 200
+    assert client.post("/upload/upload", headers={"X-CSRF-Token": token}).status_code == 401
+
+
+@pytest.mark.parametrize("username,password", [("publisher", ""), ("", "fake"), (" ", "fake"), ("publisher", " ")])
+def test_publisher_configuration_requires_both(monkeypatch, username, password):
+    monkeypatch.setenv("PUBLISHER_USERNAME", username)
+    monkeypatch.setenv("PUBLISHER_PASSWORD", password)
+    with pytest.raises(RuntimeError, match="must both be set"):
+        server.Settings.from_env()
+
+
+def test_publisher_username_collision(monkeypatch):
+    monkeypatch.setenv("PUBLISHER_USERNAME", os.environ["ADMIN_USERNAME"])
+    monkeypatch.setenv("PUBLISHER_PASSWORD", "fake")
+    with pytest.raises(RuntimeError, match="must differ"):
+        server.Settings.from_env()
+
+
+def test_disabled_publisher_and_admin_upload_portal(client):
+    token = portal_csrf(client)
+    assert client.post("/upload/login", data={"username": "publisher",
+                       "password": "fake-publisher-password", "csrf": token}).status_code == 401
+    assert client.post("/upload/login", data={"username": "admin", "password": "secret-password",
+                       "csrf": token}).status_code == 200
+    assert client.get("/admin").status_code == 200
+    token = portal_csrf(client)
+    with patch.object(server, "validate_video"):
+        assert client.post("/upload/upload", content=b"admin publish", headers={
+            "Content-Type": "video/mp4", "X-CSRF-Token": token}).status_code == 200
+
+
+def test_disabled_publisher_revokes_cookie(publisher_client, tmp_path):
+    token = publisher_sign_in(publisher_client)
+    cookie = publisher_client.cookies.get("signage_session")
+    settings = server.Settings("admin", "secret-password", "s" * 40, "t" * 40, tmp_path, 1, False)
+    with TestClient(server.create_app(settings)) as disabled:
+        disabled.cookies.set("signage_session", cookie)
+        assert disabled.post("/upload/upload", headers={"X-CSRF-Token": token}).status_code == 401
+
+
+def test_legacy_authenticated_boolean_is_not_authorization(client):
+    import base64
+    from itsdangerous import TimestampSigner
+    data = base64.b64encode(json.dumps({"authenticated": True, "csrf": "legacy"}).encode())
+    cookie = TimestampSigner("s" * 40).sign(data).decode()
+    client.cookies.set("signage_session", cookie)
+    assert client.post("/admin/upload", headers={"X-CSRF-Token": "legacy"}).status_code == 401
+    assert client.post("/upload/upload", headers={"X-CSRF-Token": "legacy"}).status_code == 401
+
+
+def test_login_rate_limit_shared_across_portals(publisher_client):
+    token = portal_csrf(publisher_client)
+    for attempt in range(10):
+        route = "/upload/login" if attempt % 2 else "/admin/login"
+        assert publisher_client.post(route, data={"username": "publisher", "password": "wrong",
+                                     "csrf": token}).status_code == 401
+    assert publisher_client.post("/upload/login", data={"username": "publisher",
+                                 "password": "fake-publisher-password", "csrf": token}).status_code == 429
