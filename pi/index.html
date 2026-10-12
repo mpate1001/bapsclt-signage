@@ -4,12 +4,22 @@
 <title>BAPS Charlotte Signage</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#ddd;font:20px system-ui}
+html.cursor-idle,html.cursor-idle *{cursor:none!important}
 video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:#000}
 video.pending{visibility:hidden}#message{position:fixed;inset:0;display:grid;place-items:center;text-align:center}
 </style>
 <div id="message" role="status">Waiting for the first video</div>
 <script>
 (() => {
+  let cursorTimer;
+  function showCursor() {
+    document.documentElement.classList.remove('cursor-idle');
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => document.documentElement.classList.add('cursor-idle'), 3000);
+  }
+  document.addEventListener('pointermove', showCursor, {passive:true});
+  document.addEventListener('pointerdown', showCursor, {passive:true});
+  showCursor();
   let current = null, currentVersion = null, pending = null;
   const message = document.getElementById('message');
   async function check() {

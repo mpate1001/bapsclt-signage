@@ -5,6 +5,7 @@
   <title>BAPS CLT · Display</title>
   <style>
     html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000}
+    html.cursor-idle,html.cursor-idle *{cursor:none!important}
     video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:black}
     #waiting{position:fixed;inset:0;display:grid;place-items:center;font:18px system-ui,sans-serif;color:#b5b5b5}
     #resume{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:5;padding:14px 24px;background:#fff;color:#111;border:0;border-radius:6px;font:16px system-ui,sans-serif}
@@ -14,6 +15,17 @@
   <div id="waiting" role="status">Waiting for a published video</div>
   <button id="resume" hidden>Start playback</button>
 <script>
+(() => {
+  let cursorTimer;
+  function showCursor() {
+    document.documentElement.classList.remove('cursor-idle');
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => document.documentElement.classList.add('cursor-idle'), 3000);
+  }
+  document.addEventListener('pointermove', showCursor, {passive:true});
+  document.addEventListener('pointerdown', showCursor, {passive:true});
+  showCursor();
+})();
 let currentVersion = null;
 let active = null;
 let busy = false;
